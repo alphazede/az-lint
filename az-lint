@@ -438,6 +438,8 @@ def find_package_typecheck(file_abs: Path, repo_root: Path) -> Path | None:
                 data = json.loads(pkg.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 return None
+            if not isinstance(data, dict):
+                return None
             scripts = data.get("scripts")
             if isinstance(scripts, dict) and isinstance(scripts.get("typecheck"), str):
                 return cur.resolve()
@@ -1091,7 +1093,11 @@ def scan_secrets(
             "--ignore-gitleaks-allow",
             f"--gitleaks-ignore-path={ignore_path}",
         ]
-        commands = [[exe, "git", *flags, f"--log-opts={rng}", "."] for rng in ranges]
+        # Include changes introduced at merges as well as ordinary commits.
+        commands = [
+            [exe, "git", *flags, f"--log-opts=--diff-merges=first-parent {rng}", "."]
+            for rng in ranges
+        ]
         commands.extend(
             [exe, "dir", *flags, str(repo_root / rel)]
             for rel in files
@@ -1401,7 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
 
     target = Path(args.repo).resolve()
     top_res = run_cmd(
-        ["git", "-C", str(target), "rev-parse", "--show-toplevel"], cwd=target
+        ["git", "-C", str(target), "rev-parse", "--show-toplevel"], cwd=Path.cwd()
     )
     if top_res.returncode != 0:
         sys.stderr.write(f"az-lint: not a git repository: {target}\n")

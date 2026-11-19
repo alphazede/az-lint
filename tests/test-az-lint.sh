@@ -121,7 +121,8 @@ case "$tool" in
       grep -Eq '^token = "ghp_[[:alnum:]]{36}"' "${!#}" && exit 1
     else
       [[ "$1" == git && -n "${range:-}" ]] || exit 2
-      patch=$(git log -p "$range" --) || exit 2
+      read -r -a log_opts <<<"$range"
+      patch=$(git log -p "${log_opts[@]}" --) || exit 2
       if grep -Eq '^\+token = "ghp_[[:alnum:]]{36}"' <<<"$patch"; then
         if [[ ! -f "${ignore:-}" ]] || ! grep -q ':allowlisted.txt:github-pat:1$' "$ignore"; then
           exit 1
@@ -544,6 +545,9 @@ EMPTY="$WORK/empty.git"
 new_repo "$FIX"
 git init --bare -qb main "$EMPTY"
 git -C "$FIX" remote add origin "$EMPTY"
+"$AZ_LINT" --repo "$WORK/missing-repo" --changed >"$WORK/missing-repo.out" 2>&1
+assert_rc "missing repository returns an input error" 2 "$?" "$WORK/missing-repo.out"
+assert_grep "missing repository explains the error" '^az-lint: not a git repository:' "$WORK/missing-repo.out"
 printf 'import sys\n' >"$FIX/bad.py"
 save_commit "$FIX"
 FIRST=$(git -C "$FIX" rev-parse HEAD)
@@ -564,7 +568,33 @@ git -C "$FIX" checkout -q --orphan base
 git -C "$FIX" commit -qm base --allow-empty
 git -C "$FIX" push -qu origin HEAD:main
 BASE=$(git -C "$FIX" rev-parse HEAD)
-git -C "$FIX" checkout -qb one
+
+git -C "$FIX" checkout -qb merge-scan-side "$BASE"
+git -C "$FIX" commit -qm side --allow-empty
+git -C "$FIX" checkout -qb merge-scan "$BASE"
+git -C "$FIX" commit -qm local --allow-empty
+git -C "$FIX" merge -q --no-ff --no-commit merge-scan-side
+git -C "$FIX" show "$TIP^:leak.txt" >"$FIX/leak.txt"
+save_commit "$FIX"
+MERGED=$(git -C "$FIX" rev-parse HEAD)
+"$AZ_LINT" --repo "$FIX" --changed "$BASE" >"$WORK/merge-scan-changed.out" 2>&1
+assert_rc "changed mode scans the merge diff" 1 "$?" "$WORK/merge-scan-changed.out"
+assert_tool_status "changed mode merge diff" FAIL "$WORK/merge-scan-changed.out" gitleaks
+run_push "$FIX" "$WORK/merge-scan-push.out" "refs/heads/merge-scan $MERGED refs/heads/merge-scan $ZERO"
+assert_rc "pre-push scans the merge diff" 1 "$?" "$WORK/merge-scan-push.out"
+assert_tool_status "pre-push merge diff" FAIL "$WORK/merge-scan-push.out" gitleaks
+
+git -C "$FIX" checkout -qb non-object-manifest "$BASE"
+printf 'null\n' >"$FIX/package.json"
+printf 'export const value = 1;\n' >"$FIX/value.ts"
+printf '[tools]\nbiome = false\n' >"$FIX/.az-lint.toml"
+save_commit "$FIX"
+"$AZ_LINT" --repo "$FIX" --changed "$BASE" >"$WORK/non-object-manifest.out" 2>&1
+assert_rc "non-object manifest leaves independent checks runnable" 0 "$?" "$WORK/non-object-manifest.out"
+assert_tool_status "non-object manifest" SKIP "$WORK/non-object-manifest.out" tsc
+assert_tool_status "non-object manifest" PASS "$WORK/non-object-manifest.out" gitleaks
+
+git -C "$FIX" checkout -qb one "$BASE"
 printf 'value = 1\n' >"$FIX/one.py"
 printf 'value = 1\n' >"$FIX/shared.py"
 save_commit "$FIX"

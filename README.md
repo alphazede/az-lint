@@ -1,14 +1,18 @@
 # az-lint
 
-az-lint runs language linters against changed files in a Git repository. Run it
+az-lint selects language linters by the extensions of changed files. Run it
 with `--changed <base>` in CI or install the pre-push hook to check outgoing
 commits and file changes before a push.
 
 ## Tools
 
 Install Git, Bash, Python 3.10 or newer, Gitleaks, and the linters for your files.
-The runner looks for linters on `PATH`. TypeScript uses the project's local
-`node_modules/.bin/tsc` when its `package.json` defines a `typecheck` script.
+The runner looks for linters on `PATH`. Biome can also use a local installation.
+When `package.json` defines a `typecheck` script, the runner invokes the local
+`node_modules/.bin/tsc --noEmit` directly. Clippy uses `--offline --locked` by
+default, so keep `Cargo.lock` and install project dependencies before linting.
+Run az-lint with the same trust and isolation you use for the project's build.
+Project tools such as Clippy can execute build scripts.
 
 | Files | Linters and tested versions |
 | --- | --- |
@@ -23,9 +27,9 @@ The runner looks for linters on `PATH`. TypeScript uses the project's local
 | Secret scanning | Gitleaks 8.30.1 |
 | Static analysis | Semgrep 1.183.0 |
 
-The self-tests used Git 2.53.0 and Python 3.14.4 on Linux. Install PyYAML
-(tested with 6.0.3) if az-lint needs to extend an existing Actionlint
-configuration.
+On 2026-11-19, the package self-tests used the tool versions above with Git
+2.53.0 and Python 3.14.4 on Linux. Install PyYAML if az-lint needs to extend an
+existing Actionlint configuration. The self-tests used PyYAML 6.0.3.
 
 ## Install the pre-push hook
 
@@ -88,12 +92,13 @@ args = ["--ignore", "E501"]
 args = ["--config", "rules/semgrep.yml"]
 ```
 
-Gitleaks runs for outgoing history and for commit ranges and uncommitted
-changes in `--changed` mode. It scans the full history on a first push to
-an empty remote. Lint exclusions, `enabled`, and argument overrides cannot
-disable or change the scan. Record approved fingerprint exceptions in
-`.gitleaksignore` at the repository root. The runner suppresses Gitleaks output
-and reports the status.
+Gitleaks scans outgoing history, including merge commits. In `--changed`
+mode, it scans the commit range and uncommitted changes in the working tree.
+It scans the full history on a first push to an empty remote. Lint exclusions,
+`enabled`, and argument overrides cannot disable or change the scan. Record
+approved fingerprint exceptions in `.gitleaksignore` at the repository root.
+A finding in a merge diff has its own fingerprint. The runner suppresses
+Gitleaks output and reports the status.
 
 Semgrep checks changed files when it finds `.semgrep.yml` or `.semgrep` at the
 repository root, or when you supply a rules configuration. Its findings and
