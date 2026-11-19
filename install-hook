@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	printf '%s\n' "usage: install-hook [<repo>]" >&2
+	exit 2
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+	usage
+fi
+if [[ $# -gt 1 ]]; then
+	usage
+fi
+
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+	GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+	GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_SHALLOW_FILE \
+	GIT_INTERNAL_SUPER_PREFIX
+
+REPO_ARG="${1:-.}"
+REPO_TOP=$(git -C "$REPO_ARG" rev-parse --show-toplevel 2>/dev/null) || {
+	printf 'install-hook: not a git repository: %s\n' "$REPO_ARG" >&2
+	exit 2
+}
+
+SELF_PATH=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")
+LINT_DIR=$(dirname -- "$SELF_PATH")
+PRE_PUSH_SRC="$LINT_DIR/pre-push"
+if [[ ! -x "$PRE_PUSH_SRC" ]]; then
+	printf 'install-hook: missing executable pre-push script: %s\n' "$PRE_PUSH_SRC" >&2
+	exit 1
+fi
+
+COMMON_DIR=$(git -C "$REPO_TOP" rev-parse --path-format=absolute --git-common-dir)
+HOOKS_DIR="$COMMON_DIR/hooks"
+CURRENT_HOOK=$(git -C "$REPO_TOP" rev-parse --path-format=absolute --git-path hooks/pre-push)
+CURRENT_DIR=$(dirname -- "$CURRENT_HOOK")
+CONFIGURED_HOOKS=$(git -C "$REPO_TOP" config --type=path --get core.hooksPath || true)
+HOOKS_SCOPE=$(git -C "$REPO_TOP" config --show-scope --get core.hooksPath || true)
+HOOKS_SCOPE=${HOOKS_SCOPE%%$'\t'*}
+SET_SHARED_PATH=false
+if [[ "$HOOKS_SCOPE" == local && "$CONFIGURED_HOOKS" == /* ]]; then
+	HOOKS_DIR="$CURRENT_DIR"
+elif [[ "$HOOKS_SCOPE" == local ]]; then
+	# Git resolves a relative hooksPath from each checkout. Anchor it once
+	# at the primary checkout so existing and future worktrees share it.
+	IFS= read -r -d '' PRIMARY < <(git -C "$REPO_TOP" worktree list --porcelain -z)
+	HOOKS_DIR="${PRIMARY#worktree }/$CONFIGURED_HOOKS"
+	SET_SHARED_PATH=true
+elif [[ -n "$HOOKS_SCOPE" ]]; then
+	SET_SHARED_PATH=true
+fi
+
+real_path() {
+	python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+for CHECK in "$CURRENT_HOOK" "$HOOKS_DIR/pre-push"; do
+	if [[ -e "$CHECK" || -L "$CHECK" ]]; then
+		if [[ -x "$CHECK" && "$(real_path "$CHECK")" == "$PRE_PUSH_SRC" ]]; then
+			continue
+		fi
+		printf 'install-hook: conflicting hook exists at %s; integrate az-lint --pre-push manually\n' "$CHECK" >&2
+		exit 1
+	fi
+done
+
+mkdir -p "$HOOKS_DIR"
+if [[ "$(real_path "$CURRENT_DIR")" != "$(real_path "$HOOKS_DIR")" ]]; then
+	# A local override must keep the other hooks selected by inherited config.
+	for OTHER in "$CURRENT_DIR"/*; do
+		[[ -x "$OTHER" && -f "$OTHER" && "${OTHER##*/}" != pre-push ]] || continue
+		DEST="$HOOKS_DIR/${OTHER##*/}"
+		if [[ -e "$DEST" || -L "$DEST" ]]; then
+			if [[ "$(real_path "$DEST")" != "$(real_path "$OTHER")" ]]; then
+				printf 'install-hook: conflicting hook exists at %s\n' "$DEST" >&2
+				exit 1
+			fi
+		else
+			ln -s "$OTHER" "$DEST"
+		fi
+	done
+fi
+TARGET="$HOOKS_DIR/pre-push"
+if [[ ! -L "$TARGET" ]]; then
+	ln -s "$PRE_PUSH_SRC" "$TARGET"
+fi
+if "$SET_SHARED_PATH"; then
+	git -C "$REPO_TOP" config --local core.hooksPath "$HOOKS_DIR"
+fi
+
+while IFS= read -r -d '' RECORD; do
+	[[ "$RECORD" == 'worktree '* ]] || continue
+	CHECKOUT=${RECORD#worktree }
+	[[ -d "$CHECKOUT" ]] || continue
+	EFFECTIVE=$(git -C "$CHECKOUT" rev-parse --path-format=absolute --git-path hooks/pre-push)
+	if [[ ! -x "$EFFECTIVE" || "$(real_path "$EFFECTIVE")" != "$PRE_PUSH_SRC" ]]; then
+		printf 'install-hook: Git does not resolve the shared pre-push hook in %s\n' "$CHECKOUT" >&2
+		exit 1
+	fi
+done < <(git -C "$REPO_TOP" worktree list --porcelain -z)
+printf 'install-hook: verified %s -> %s\n' "$TARGET" "$PRE_PUSH_SRC"

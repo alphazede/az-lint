@@ -1,0 +1,33 @@
+---
+name: Test
+on:  # yamllint disable-line rule:truthy
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Run self-tests with stub linters
+        shell: bash
+        # yamllint disable rule:line-length
+        run: |
+          python3 -m venv "$RUNNER_TEMP/az-lint-venv"
+          source "$RUNNER_TEMP/az-lint-venv/bin/activate"
+          cat <<'REQUIREMENTS' | python3 -m pip install --require-hashes --only-binary=:all: --target "$RUNNER_TEMP/az-lint-python" -r /dev/stdin
+          PyYAML==6.0.3 \
+            --hash=sha256:b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d \
+            --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+            --hash=sha256:0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6 \
+            --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5
+          REQUIREMENTS
+          export PYTHONPATH="$RUNNER_TEMP/az-lint-python"
+          AZ_LINT_STUBS_ONLY=1 bash tests/test-az-lint.sh
+        # yamllint enable rule:line-length

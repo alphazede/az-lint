@@ -1,0 +1,1526 @@
+#!/usr/bin/env python3
+"""Run repository linters on changed files.
+
+Runs language-appropriate linters on changed files only, honors `.az-lint.toml`,
+and supports both `--changed <base>` and `--pre-push` hook modes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - Python < 3.11 fallback
+    tomllib = None  # type: ignore[assignment]
+
+
+GIT_HOOK_ENV_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_PREFIX",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_SHALLOW_FILE",
+    "GIT_INTERNAL_SUPER_PREFIX",
+)
+
+PY_EXTS = {".py", ".pyi"}
+SH_EXTS = {".sh", ".bash"}
+YAML_EXTS = {".yml", ".yaml"}
+JS_TS_EXTS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}
+SQL_EXTS = {".sql"}
+VERILOG_EXTS = {".v", ".vh", ".sv", ".svh"}
+C_CPP_EXTS = {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"}
+RUST_EXTS = {".rs"}
+
+ALL_TOOL_IDS = (
+    "cargo-fmt",
+    "cargo-clippy",
+    "ruff-check",
+    "ruff-format",
+    "shellcheck",
+    "shfmt",
+    "actionlint",
+    "yamllint",
+    "biome",
+    "tsc",
+    "sqlfluff",
+    "verible-lint",
+    "verible-format",
+    "verilator",
+    "clang-format",
+    "cppcheck",
+    "gitleaks",
+    "semgrep",
+)
+
+GROUP_ALIASES = {
+    "rust": ("cargo-fmt", "cargo-clippy"),
+    "cargo": ("cargo-fmt", "cargo-clippy"),
+    "python": ("ruff-check", "ruff-format"),
+    "ruff": ("ruff-check", "ruff-format"),
+    "shell": ("shellcheck", "shfmt"),
+    "yaml": ("yamllint",),
+    "ts": ("biome", "tsc"),
+    "js": ("biome", "tsc"),
+    "sql": ("sqlfluff",),
+    "verilog": ("verible-lint", "verible-format", "verilator"),
+    "verible": ("verible-lint", "verible-format"),
+    "c": ("clang-format", "cppcheck"),
+    "cpp": ("clang-format", "cppcheck"),
+}
+
+
+class ConfigError(ValueError):
+    """Raised when `.az-lint.toml` is malformed or invalid."""
+
+
+@dataclass
+class ToolConfig:
+    enabled: bool = True
+    args: list[str] | None = None
+    override_args: list[str] | None = None
+    exclude: list[str] | None = None
+
+
+@dataclass
+class LintConfig:
+    global_exclude: list[str]
+    tools: dict[str, ToolConfig]
+
+
+@dataclass
+class ToolResult:
+    tool_id: str
+    status: str  # PASS | FAIL | SKIP | MISSING
+    detail: str
+    elapsed: float
+    blocking: bool = True
+    output: str = ""
+    advisory_stdout: str = ""
+
+
+def _strip_toml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_double:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:idx]
+    return line
+
+
+def _parse_toml_value(raw: str) -> Any:
+    val = raw.strip()
+    if val == "true":
+        return True
+    if val == "false":
+        return False
+    if (val.startswith('"') and val.endswith('"')) or (
+        val.startswith("'") and val.endswith("'")
+    ):
+        if val.startswith('"'):
+            return bytes(val[1:-1], "utf-8").decode("unicode_escape")
+        return val[1:-1]
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        if not inner:
+            return []
+        items: list[Any] = []
+        buf: list[str] = []
+        in_s = False
+        in_d = False
+        esc = False
+        for ch in inner:
+            if esc:
+                buf.append(ch)
+                esc = False
+                continue
+            if ch == "\\" and in_d:
+                buf.append(ch)
+                esc = True
+                continue
+            if ch == "'" and not in_d:
+                in_s = not in_s
+            elif ch == '"' and not in_s:
+                in_d = not in_d
+            if ch == "," and not in_s and not in_d:
+                token = "".join(buf).strip()
+                if token:
+                    items.append(_parse_toml_value(token))
+                buf = []
+            else:
+                buf.append(ch)
+        tail = "".join(buf).strip()
+        if tail:
+            items.append(_parse_toml_value(tail))
+        return items
+    try:
+        return int(val)
+    except ValueError as exc:
+        raise ConfigError(f"Unsupported TOML value: {raw!r}") from exc
+
+
+def _fallback_parse_toml(text: str) -> dict[str, Any]:
+    """Parse the subset of TOML used by `.az-lint.toml` on Python < 3.11."""
+    root: dict[str, Any] = {}
+    section: dict[str, Any] = root
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        line = _strip_toml_comment(lines[idx]).strip()
+        idx += 1
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            header = line[1:-1].strip()
+            if not header:
+                raise ConfigError("Empty TOML table header")
+            cur = root
+            for part in header.split("."):
+                part = part.strip().strip('"').strip("'")
+                nxt = cur.get(part)
+                if nxt is None:
+                    nxt = {}
+                    cur[part] = nxt
+                elif not isinstance(nxt, dict):
+                    raise ConfigError(f"TOML key {part!r} redefined as table")
+                cur = nxt
+            section = cur
+            continue
+        if "=" not in line:
+            raise ConfigError(f"Invalid TOML line: {line!r}")
+        key, rhs = line.split("=", 1)
+        key = key.strip().strip('"').strip("'")
+        rhs = rhs.strip()
+        while rhs.startswith("[") and not rhs.endswith("]") and idx < len(lines):
+            rhs += " " + _strip_toml_comment(lines[idx]).strip()
+            idx += 1
+        section[key] = _parse_toml_value(rhs)
+    return root
+
+
+def load_config(config_path: Path | None) -> LintConfig:
+    tools = {tid: ToolConfig() for tid in ALL_TOOL_IDS}
+    if config_path is None or not config_path.is_file():
+        return LintConfig(global_exclude=[], tools=tools)
+    raw_text = config_path.read_text(encoding="utf-8")
+    try:
+        if tomllib is not None:
+            data = tomllib.loads(raw_text)
+        else:
+            data = _fallback_parse_toml(raw_text)
+    except Exception as exc:
+        raise ConfigError(f"Failed to parse {config_path}") from exc
+
+    global_exclude_raw = data.get("exclude", [])
+    if not isinstance(global_exclude_raw, list) or not all(
+        isinstance(x, str) for x in global_exclude_raw
+    ):
+        raise ConfigError(f"{config_path}: 'exclude' must be a list of strings")
+
+    tools_section = data.get("tools", {})
+    if not isinstance(tools_section, dict):
+        raise ConfigError(f"{config_path}: '[tools]' must be a table")
+
+    for name, value in tools_section.items():
+        if name == "gitleaks":
+            continue  # Its only repository input is the native fingerprint allowlist.
+        targets = (name,) if name in tools else GROUP_ALIASES.get(name, ())
+        if not targets:
+            raise ConfigError(f"{config_path}: unknown tool {name!r}")
+        if isinstance(value, bool):
+            for target in targets:
+                tools[target].enabled = value
+        elif isinstance(value, dict):
+            enabled = value.get("enabled")
+            args = value.get("args")
+            override_args = value.get("override_args")
+            exclude = value.get("exclude")
+            if enabled is not None and not isinstance(enabled, bool):
+                raise ConfigError(f"{config_path}: tools.{name}.enabled must be bool")
+            for field_name, field_val in (
+                ("args", args),
+                ("override_args", override_args),
+                ("exclude", exclude),
+            ):
+                if field_val is not None and (
+                    not isinstance(field_val, list)
+                    or not all(isinstance(x, str) for x in field_val)
+                ):
+                    raise ConfigError(
+                        f"{config_path}: tools.{name}.{field_name} must be list of strings"
+                    )
+            for target in targets:
+                if enabled is not None:
+                    tools[target].enabled = enabled
+                if args is not None:
+                    tools[target].args = list(args)
+                if override_args is not None:
+                    tools[target].override_args = list(override_args)
+                if exclude is not None:
+                    tools[target].exclude = list(exclude)
+        else:
+            raise ConfigError(f"{config_path}: tools.{name} must be a boolean or table")
+
+    return LintConfig(global_exclude=list(global_exclude_raw), tools=tools)
+
+
+def path_matches_pattern(rel_path: str, pattern: str) -> bool:
+    rel = rel_path.lstrip("./")
+    pat = pattern.lstrip("./")
+    if pat.endswith("/"):
+        return rel.startswith(pat)
+    if "**" in pat:
+        # Convert glob with ** into regex for accurate recursive segment matching.
+        parts = re.split(r"(\*\*/|\*\*|\*|\?)", pat)
+        regex_parts = ["^"]
+        for part in parts:
+            if part == "**/":
+                regex_parts.append("(?:.*/)?")
+            elif part == "**":
+                regex_parts.append(".*")
+            elif part == "*":
+                regex_parts.append("[^/]*")
+            elif part == "?":
+                regex_parts.append("[^/]")
+            else:
+                regex_parts.append(re.escape(part))
+        regex_parts.append("$")
+        return re.match("".join(regex_parts), rel) is not None
+    if "/" not in pat:
+        return fnmatch.fnmatch(PurePosixPath(rel).name, pat) or fnmatch.fnmatch(
+            rel, pat
+        )
+    return fnmatch.fnmatch(rel, pat)
+
+
+def is_excluded(rel_path: str, patterns: list[str]) -> bool:
+    return any(path_matches_pattern(rel_path, pat) for pat in patterns)
+
+
+def run_cmd(
+    cmd: list[str],
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        env=env,
+        input=input_bytes,
+        capture_output=True,
+        check=False,
+    )
+
+
+def git_lines_z(repo: Path, args: list[str]) -> list[str]:
+    res = run_cmd(["git", "-C", str(repo), *args], cwd=repo)
+    if res.returncode != 0:
+        err = res.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {err}")
+    raw = res.stdout.split(b"\x00")
+    return [item.decode("utf-8", errors="surrogateescape") for item in raw if item]
+
+
+def resolve_default_branch(repo: Path, remote: str = "origin") -> str | None:
+    sym = run_cmd(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "symbolic-ref",
+            "--quiet",
+            f"refs/remotes/{remote}/HEAD",
+        ],
+        cwd=repo,
+    )
+    if sym.returncode == 0:
+        ref = sym.stdout.decode("utf-8", errors="replace").strip()
+        if ref:
+            return ref
+    for candidate in (
+        f"refs/remotes/{remote}/main",
+        f"refs/remotes/{remote}/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    ):
+        chk = run_cmd(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", candidate],
+            cwd=repo,
+        )
+        if chk.returncode == 0:
+            return candidate
+    return None
+
+
+def find_merge_base(repo: Path, ref_a: str, ref_b: str) -> str | None:
+    mb = run_cmd(
+        ["git", "-C", str(repo), "merge-base", ref_a, ref_b],
+        cwd=repo,
+    )
+    if mb.returncode == 0:
+        return mb.stdout.decode("utf-8", errors="replace").strip() or None
+    return None
+
+
+def is_workflow_file(rel_path: str) -> bool:
+    p = PurePosixPath(rel_path)
+    return (
+        len(p.parts) == 3
+        and p.parts[0] == ".github"
+        and p.parts[1] == "workflows"
+        and p.suffix.lower() in YAML_EXTS
+    )
+
+
+def find_cargo_workspace(file_abs: Path, repo_root: Path) -> Path | None:
+    cur = file_abs.parent
+    repo_resolved = repo_root.resolve()
+    while True:
+        if (cur / "Cargo.toml").is_file():
+            res = run_cmd(
+                ["cargo", "locate-project", "--workspace", "--message-format", "plain"],
+                cwd=cur,
+            )
+            if res.returncode == 0:
+                manifest = Path(res.stdout.decode("utf-8", errors="replace").strip())
+                ws_root = manifest.parent.resolve()
+                try:
+                    ws_root.relative_to(repo_resolved)
+                    return ws_root
+                except ValueError:
+                    return cur.resolve()
+            return cur.resolve()
+        if cur.resolve() == repo_resolved or cur == cur.parent:
+            break
+        cur = cur.parent
+    return None
+
+
+def find_package_typecheck(file_abs: Path, repo_root: Path) -> Path | None:
+    cur = file_abs.parent
+    repo_resolved = repo_root.resolve()
+    while True:
+        pkg = cur / "package.json"
+        if pkg.is_file():
+            try:
+                data = json.loads(pkg.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            scripts = data.get("scripts")
+            if isinstance(scripts, dict) and isinstance(scripts.get("typecheck"), str):
+                return cur.resolve()
+            return None
+        if cur.resolve() == repo_resolved or cur == cur.parent:
+            break
+        cur = cur.parent
+    return None
+
+
+def resolve_js_tool(
+    name: str, pkg_dir: Path | None, repo_root: Path, *, local_only: bool = False
+) -> str | None:
+    candidates: list[Path] = []
+    if pkg_dir is not None:
+        candidates.append(pkg_dir / "node_modules" / ".bin" / name)
+    candidates.append(repo_root / "node_modules" / ".bin" / name)
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None if local_only else shutil.which(name)
+
+
+def file_operand(path: str) -> str:
+    return f"./{path}"
+
+
+def scoped_diagnostics(
+    tool_id: str,
+    result: subprocess.CompletedProcess[bytes],
+    root: Path,
+    files: list[str],
+) -> tuple[bool, bool]:
+    """Classify a failed project check using the tool's diagnostic locations."""
+    changed = {(root / file).resolve() for file in files}
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    locations: list[str] = []
+    project_error = False
+    if tool_id == "cargo-clippy":
+        for line in stdout.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                project_error = True
+                continue
+            if record.get("reason") != "compiler-message":
+                continue
+            message = record["message"]
+            if message["level"] != "error":
+                continue
+            primary = [
+                span["file_name"] for span in message["spans"] if span["is_primary"]
+            ]
+            locations.extend(primary)
+            project_error |= not primary
+        project_error |= any(
+            line.startswith("error:")
+            and not line.startswith("error: could not compile ")
+            for line in stderr.splitlines()
+        )
+    elif tool_id == "cargo-fmt":
+        locations = re.findall(r"^Diff in (.+):[0-9]+:$", stdout, re.MULTILINE)
+        project_error = result.returncode != 1 or bool(stderr.strip())
+    else:
+        # A tsconfig may enable colored output even when stdout is captured.
+        text = re.sub(r"\x1b\[[0-9;]*m", "", stdout + "\n" + stderr)
+        locations = re.findall(
+            r"^(.+?)(?:\(\d+,\d+\)|:\d+:\d+) ?[: -]+error TS\d+:",
+            text,
+            re.MULTILINE,
+        )
+        project_error = bool(re.search(r"^error TS\d+:", text, re.MULTILINE))
+        project_error |= result.returncode not in (1, 2)
+
+    is_changed = [(root / path).resolve() in changed for path in locations]
+    return project_error or not locations or any(is_changed), not all(is_changed)
+
+
+def format_cmd(cmd: list[str]) -> str:
+    return " ".join(
+        subprocess.list2cmdline([arg]) if " " in arg else arg for arg in cmd
+    )
+
+
+def execute_tool(
+    tool_id: str,
+    cfg: ToolConfig,
+    files: list[str],
+    work_root: Path,
+    repo_root: Path,
+    gitleaks_ranges: list[str],
+    uncommitted_files: list[str],
+) -> ToolResult:
+    t0 = time.monotonic()
+    blocking = tool_id != "semgrep"
+
+    if not cfg.enabled:
+        return ToolResult(
+            tool_id=tool_id,
+            status="SKIP",
+            detail="disabled in .az-lint.toml",
+            elapsed=time.monotonic() - t0,
+            blocking=blocking,
+        )
+
+    tool_excludes = cfg.exclude or []
+    filtered_files = [
+        f
+        for f in files
+        if not is_excluded(f, tool_excludes)
+        and (work_root / f).is_file()
+        and not (work_root / f).is_symlink()
+    ]
+
+    if tool_id != "gitleaks" and not filtered_files:
+        return ToolResult(
+            tool_id=tool_id,
+            status="SKIP",
+            detail="no matching files",
+            elapsed=time.monotonic() - t0,
+            blocking=blocking,
+        )
+
+    extra_args = cfg.args or []
+    operands = [file_operand(file) for file in filtered_files]
+
+    def run_simple(
+        binary: str, base_cmd: list[str], per_file: bool = False
+    ) -> ToolResult:
+        exe = shutil.which(binary)
+        if exe is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail=f"tool missing: {binary} not on PATH"
+                + (" (advisory)" if not blocking else ""),
+                elapsed=time.monotonic() - t0,
+                blocking=blocking,
+            )
+        cmd_prefix = (
+            [exe, *cfg.override_args]
+            if cfg.override_args is not None
+            else [exe, *base_cmd[1:], *extra_args]
+        )
+        log_chunks: list[str] = []
+        worst_rc = 0
+        if per_file:
+            for rel in operands:
+                cmd = [*cmd_prefix, rel]
+                res = run_cmd(cmd, cwd=work_root)
+                out = (
+                    res.stdout.decode("utf-8", errors="replace")
+                    + res.stderr.decode("utf-8", errors="replace")
+                ).strip()
+                log_chunks.append(f"$ {format_cmd(cmd)} -> exit {res.returncode}")
+                if out:
+                    log_chunks.append(out)
+                if res.returncode != 0 and worst_rc == 0:
+                    worst_rc = res.returncode
+        else:
+            cmd = [*cmd_prefix, *operands]
+            res = run_cmd(cmd, cwd=work_root)
+            out = (
+                res.stdout.decode("utf-8", errors="replace")
+                + res.stderr.decode("utf-8", errors="replace")
+            ).strip()
+            log_chunks.append(f"$ {format_cmd(cmd)} -> exit {res.returncode}")
+            if out:
+                log_chunks.append(out)
+            worst_rc = res.returncode
+        status = "PASS" if worst_rc == 0 else "FAIL"
+        detail = f"{len(filtered_files)} file(s)"
+        if worst_rc != 0:
+            detail += f" (exit {worst_rc})"
+        return ToolResult(
+            tool_id=tool_id,
+            status=status,
+            detail=detail,
+            elapsed=time.monotonic() - t0,
+            blocking=blocking,
+            output="\n".join(log_chunks),
+        )
+
+    if tool_id == "ruff-check":
+        return run_simple("ruff", ["ruff", "check"])
+    if tool_id == "ruff-format":
+        return run_simple("ruff", ["ruff", "format", "--check"])
+    if tool_id == "shellcheck":
+        return run_simple("shellcheck", ["shellcheck"])
+    if tool_id == "shfmt":
+        return run_simple("shfmt", ["shfmt", "-d"])
+    if tool_id == "yamllint":
+        return run_simple("yamllint", ["yamllint"])
+    if tool_id == "verible-lint":
+        return run_simple("verible-verilog-lint", ["verible-verilog-lint"])
+    if tool_id == "verible-format":
+        return run_simple(
+            "verible-verilog-format", ["verible-verilog-format", "--verify"]
+        )
+    if tool_id == "clang-format":
+        return run_simple("clang-format", ["clang-format", "--dry-run", "-Werror"])
+    if tool_id == "cppcheck":
+        return run_simple("cppcheck", ["cppcheck", "--error-exitcode=1", "--quiet"])
+
+    if tool_id == "sqlfluff":
+        has_dialect = any(
+            a == "--dialect" or a.startswith("--dialect=") for a in extra_args
+        )
+        base = (
+            ["sqlfluff", "lint"]
+            if has_dialect
+            else ["sqlfluff", "lint", "--dialect", "postgres"]
+        )
+        return run_simple("sqlfluff", base)
+
+    if tool_id == "actionlint":
+        exe = shutil.which("actionlint")
+        if exe is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail="tool missing: actionlint not on PATH",
+                elapsed=time.monotonic() - t0,
+            )
+        has_cfg_arg = any(
+            a == "-config-file" or a.startswith("-config-file=") for a in extra_args
+        )
+        with tempfile.TemporaryDirectory(prefix="az-actionlint-") as tmpdir:
+            cfg_args: list[str] = []
+            if not has_cfg_arg and cfg.override_args is None:
+                existing_cfg = None
+                for cand in (
+                    work_root / ".github" / "actionlint.yaml",
+                    work_root / ".github" / "actionlint.yml",
+                ):
+                    if cand.is_file():
+                        existing_cfg = cand
+                        break
+                tmp_cfg = Path(tmpdir) / "actionlint.yaml"
+                if existing_cfg is None:
+                    tmp_cfg.write_text(
+                        "self-hosted-runner:\n  labels:\n    - ubuntu-26.04\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    try:
+                        import yaml  # type: ignore[import-not-found]
+                    except ImportError:
+                        return ToolResult(
+                            tool_id,
+                            "MISSING",
+                            "PyYAML required to extend the repository's Actionlint config",
+                            time.monotonic() - t0,
+                        )
+                    try:
+                        parsed = yaml.safe_load(
+                            existing_cfg.read_text(encoding="utf-8")
+                        )
+                        if parsed is None:
+                            parsed = {}
+                        if parsed.get("self-hosted-runner") is None:
+                            parsed["self-hosted-runner"] = {}
+                        runner = parsed["self-hosted-runner"]
+                        if runner.get("labels") is None:
+                            runner["labels"] = []
+                        labels = runner["labels"]
+                        if not isinstance(labels, list):
+                            raise TypeError
+                        if "ubuntu-26.04" not in labels:
+                            labels.append("ubuntu-26.04")
+                        tmp_cfg.write_text(
+                            yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8"
+                        )
+                    except (AttributeError, OSError, TypeError, yaml.YAMLError):
+                        return ToolResult(
+                            tool_id,
+                            "FAIL",
+                            "invalid Actionlint config or runner labels",
+                            time.monotonic() - t0,
+                        )
+                cfg_args = ["-config-file", str(tmp_cfg)]
+            cmd = (
+                [exe, *cfg.override_args, *operands]
+                if cfg.override_args is not None
+                else [exe, *cfg_args, *extra_args, *operands]
+            )
+            res = run_cmd(cmd, cwd=work_root)
+            out = (
+                res.stdout.decode("utf-8", errors="replace")
+                + res.stderr.decode("utf-8", errors="replace")
+            ).strip()
+            log = f"$ {format_cmd(cmd)} -> exit {res.returncode}"
+            if out:
+                log += f"\n{out}"
+            return ToolResult(
+                tool_id=tool_id,
+                status="PASS" if res.returncode == 0 else "FAIL",
+                detail=f"{len(filtered_files)} file(s)"
+                + (f" (exit {res.returncode})" if res.returncode else ""),
+                elapsed=time.monotonic() - t0,
+                output=log,
+            )
+
+    if tool_id == "verilator":
+        exe = shutil.which("verilator")
+        if exe is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail="tool missing: verilator not on PATH",
+                elapsed=time.monotonic() - t0,
+            )
+        log_chunks: list[str] = []
+        worst_rc = 0
+        with tempfile.TemporaryDirectory(prefix="az-verilator-") as tmpdir:
+            for idx, rel in enumerate(filtered_files):
+                mdir = Path(tmpdir) / f"m{idx}"
+                rel_dir = str(PurePosixPath(rel).parent)
+                inc_args = [f"-I{rel_dir}"] if rel_dir != "." else []
+                cmd = (
+                    [exe, *cfg.override_args, "--Mdir", str(mdir), file_operand(rel)]
+                    if cfg.override_args is not None
+                    else [
+                        exe,
+                        "--lint-only",
+                        "-Wall",
+                        "--Mdir",
+                        str(mdir),
+                        *inc_args,
+                        *extra_args,
+                        file_operand(rel),
+                    ]
+                )
+                res = run_cmd(cmd, cwd=work_root)
+                out = (
+                    res.stdout.decode("utf-8", errors="replace")
+                    + res.stderr.decode("utf-8", errors="replace")
+                ).strip()
+                log_chunks.append(f"$ {format_cmd(cmd)} -> exit {res.returncode}")
+                if out:
+                    log_chunks.append(out)
+                if res.returncode != 0 and worst_rc == 0:
+                    worst_rc = res.returncode
+        return ToolResult(
+            tool_id=tool_id,
+            status="PASS" if worst_rc == 0 else "FAIL",
+            detail=f"{len(filtered_files)} file(s)"
+            + (f" (exit {worst_rc})" if worst_rc else ""),
+            elapsed=time.monotonic() - t0,
+            output="\n".join(log_chunks),
+        )
+
+    if tool_id in ("cargo-fmt", "cargo-clippy"):
+        cargo_exe = shutil.which("cargo")
+        if cargo_exe is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail="tool missing: cargo not on PATH",
+                elapsed=time.monotonic() - t0,
+            )
+        sub = "fmt" if tool_id == "cargo-fmt" else "clippy"
+        if run_cmd([cargo_exe, sub, "--version"], cwd=work_root).returncode != 0:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail=f"tool missing: cargo {sub} not installed",
+                elapsed=time.monotonic() - t0,
+            )
+        workspaces: dict[Path, list[str]] = {}
+        for rel in filtered_files:
+            ws = find_cargo_workspace(work_root / rel, work_root)
+            if ws is not None:
+                ws_rel = str((work_root / rel).resolve().relative_to(ws))
+                workspaces.setdefault(ws, []).append(ws_rel)
+        if not workspaces:
+            return ToolResult(
+                tool_id=tool_id,
+                status="SKIP",
+                detail="no Cargo workspace for changed .rs files",
+                elapsed=time.monotonic() - t0,
+            )
+        log_chunks = []
+        worst_rc = 0
+        has_advisory = False
+        for ws, ws_files in sorted(workspaces.items()):
+            if tool_id == "cargo-fmt":
+                options = (
+                    cfg.override_args
+                    if cfg.override_args is not None
+                    else ["--check", *extra_args]
+                )
+                cmd = [cargo_exe, "fmt", *options]
+            else:
+                options = (
+                    cfg.override_args
+                    if cfg.override_args is not None
+                    else [
+                        "--offline",
+                        "--locked",
+                        "--all-targets",
+                        *extra_args,
+                        "--",
+                        "-D",
+                        "warnings",
+                    ]
+                )
+                cmd = [cargo_exe, "clippy", "--message-format=json", *options]
+            res = run_cmd(cmd, cwd=ws)
+            log_chunks.append(f"[{ws}] $ {format_cmd(cmd)} -> exit {res.returncode}")
+            if res.stdout or res.stderr:
+                log_chunks.append(
+                    (res.stdout + res.stderr).decode("utf-8", errors="replace")
+                )
+            if res.returncode != 0:
+                blocks, advisory = scoped_diagnostics(tool_id, res, ws, ws_files)
+                has_advisory |= advisory
+                if blocks and worst_rc == 0:
+                    worst_rc = res.returncode
+        return ToolResult(
+            tool_id=tool_id,
+            status="PASS" if worst_rc == 0 else "FAIL",
+            detail=f"{len(workspaces)} workspace(s)"
+            + (f" (exit {worst_rc})" if worst_rc else "")
+            + ("; unchanged-file diagnostics advisory" if has_advisory else ""),
+            elapsed=time.monotonic() - t0,
+            output="\n".join(log_chunks),
+        )
+
+    if tool_id == "biome":
+        exe = resolve_js_tool("biome", None, work_root)
+        if exe is None:
+            for rel in filtered_files:
+                pkg_info = find_package_typecheck(work_root / rel, work_root)
+                if pkg_info is not None:
+                    exe = resolve_js_tool("biome", pkg_info, work_root)
+                    if exe is not None:
+                        break
+        if exe is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail="tool missing: biome not on PATH or node_modules/.bin",
+                elapsed=time.monotonic() - t0,
+            )
+        cmd = (
+            [exe, *cfg.override_args, *operands]
+            if cfg.override_args is not None
+            else [exe, "check", *extra_args, *operands]
+        )
+        res = run_cmd(cmd, cwd=work_root)
+        out = (
+            res.stdout.decode("utf-8", errors="replace")
+            + res.stderr.decode("utf-8", errors="replace")
+        ).strip()
+        log = f"$ {format_cmd(cmd)} -> exit {res.returncode}"
+        if out:
+            log += f"\n{out}"
+        return ToolResult(
+            tool_id=tool_id,
+            status="PASS" if res.returncode == 0 else "FAIL",
+            detail=f"{len(filtered_files)} file(s)"
+            + (f" (exit {res.returncode})" if res.returncode else ""),
+            elapsed=time.monotonic() - t0,
+            output=log,
+        )
+
+    if tool_id == "tsc":
+        packages: dict[Path, list[str]] = {}
+        for rel in filtered_files:
+            pkg_dir = find_package_typecheck(work_root / rel, work_root)
+            if pkg_dir is not None:
+                packages.setdefault(pkg_dir, []).append(rel)
+        if not packages:
+            return ToolResult(
+                tool_id, "SKIP", "no typecheck script defined", time.monotonic() - t0
+            )
+        log_chunks = []
+        worst_rc = 0
+        has_advisory = False
+        for pkg_dir, pkg_files in sorted(packages.items()):
+            exe = resolve_js_tool("tsc", pkg_dir, work_root, local_only=True)
+            if exe is None:
+                return ToolResult(
+                    tool_id,
+                    "MISSING",
+                    "tool missing: tsc not in local node_modules/.bin",
+                    time.monotonic() - t0,
+                    output="\n".join(log_chunks),
+                )
+            cmd = [exe, "--noEmit"]
+            res = run_cmd(cmd, cwd=pkg_dir)
+            log_chunks.append(
+                f"[{pkg_dir}] $ {format_cmd(cmd)} -> exit {res.returncode}"
+            )
+            if res.stdout or res.stderr:
+                log_chunks.append(
+                    (res.stdout + res.stderr).decode("utf-8", errors="replace")
+                )
+            if res.returncode != 0:
+                blocks, advisory = scoped_diagnostics(
+                    tool_id, res, pkg_dir, [str(work_root / rel) for rel in pkg_files]
+                )
+                has_advisory |= advisory
+                if blocks and worst_rc == 0:
+                    worst_rc = res.returncode
+        return ToolResult(
+            tool_id=tool_id,
+            status="PASS" if worst_rc == 0 else "FAIL",
+            detail=f"{len(packages)} package(s)"
+            + (f" (exit {worst_rc})" if worst_rc else "")
+            + ("; unchanged-file diagnostics advisory" if has_advisory else ""),
+            elapsed=time.monotonic() - t0,
+            output="\n".join(log_chunks),
+        )
+
+    if tool_id == "gitleaks":
+        return scan_secrets(
+            repo_root, work_root, gitleaks_ranges, uncommitted_files, t0
+        )
+
+    if tool_id == "semgrep":
+        exe = shutil.which("semgrep")
+        if exe is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="MISSING",
+                detail="tool missing: semgrep not on PATH (advisory, non-blocking)",
+                elapsed=time.monotonic() - t0,
+                blocking=False,
+            )
+        has_cfg = any(
+            a in ("-c", "-f", "--config") or a.startswith("--config=")
+            for a in extra_args
+        )
+        cfg_args: list[str] = []
+        if not has_cfg and cfg.override_args is None:
+            for cand in (
+                work_root / ".semgrep.yml",
+                work_root / ".semgrep",
+            ):
+                if cand.exists():
+                    cfg_args = ["--config", str(cand)]
+                    break
+        if not has_cfg and not cfg_args and cfg.override_args is None:
+            return ToolResult(
+                tool_id=tool_id,
+                status="SKIP",
+                detail="no offline semgrep rules config found (advisory)",
+                elapsed=time.monotonic() - t0,
+                blocking=False,
+            )
+        cmd = (
+            [exe, *cfg.override_args, *operands]
+            if cfg.override_args is not None
+            else [
+                exe,
+                "scan",
+                *cfg_args,
+                "--metrics",
+                "off",
+                "--disable-version-check",
+                "--error",
+                *extra_args,
+                *operands,
+            ]
+        )
+        res = run_cmd(cmd, cwd=work_root)
+        stdout_text = res.stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = res.stderr.decode("utf-8", errors="replace").strip()
+        combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
+        log = f"$ {format_cmd(cmd)} -> exit {res.returncode}"
+        if combined:
+            log += f"\n{combined}"
+        if res.returncode == 0:
+            return ToolResult(
+                tool_id=tool_id,
+                status="PASS",
+                detail=f"{len(filtered_files)} file(s), 0 findings (advisory)",
+                elapsed=time.monotonic() - t0,
+                blocking=False,
+                output=log,
+            )
+        if res.returncode == 1:
+            return ToolResult(
+                tool_id=tool_id,
+                status="FAIL",
+                detail=f"{len(filtered_files)} file(s), findings printed (advisory, non-blocking)",
+                elapsed=time.monotonic() - t0,
+                blocking=False,
+                output=log,
+                advisory_stdout=stdout_text or combined,
+            )
+        return ToolResult(
+            tool_id=tool_id,
+            status="FAIL",
+            detail=f"scanner error exit {res.returncode} (advisory, non-blocking)",
+            elapsed=time.monotonic() - t0,
+            blocking=False,
+            output=log,
+        )
+
+    raise AssertionError(f"Unhandled tool_id: {tool_id}")
+
+
+def scan_secrets(
+    repo_root: Path, work_root: Path, ranges: list[str], files: list[str], start: float
+) -> ToolResult:
+    if not ranges and not files:
+        return ToolResult(
+            "gitleaks",
+            "SKIP",
+            "no commit range or changed files",
+            time.monotonic() - start,
+        )
+    exe = shutil.which("gitleaks")
+    if exe is None:
+        return ToolResult(
+            "gitleaks",
+            "MISSING",
+            "tool missing: gitleaks not on PATH",
+            time.monotonic() - start,
+        )
+
+    # Pin default rules and use only the evaluated tree's native fingerprint list.
+    env = os.environ.copy()
+    env.pop("GITLEAKS_CONFIG", None)
+    env["GITLEAKS_CONFIG_TOML"] = "[extend]\nuseDefault = true\n"
+    allowlist = work_root / ".gitleaksignore"
+    has_allowlist = allowlist.is_file() and not allowlist.is_symlink()
+    with tempfile.TemporaryDirectory(prefix="az-gitleaks-") as tmpdir:
+        # Gitleaks also reads .gitleaksignore from its current directory.
+        # Bind Git's object store without exposing the live checkout's files.
+        git_dir = run_cmd(["git", "rev-parse", "--absolute-git-dir"], cwd=repo_root)
+        if git_dir.returncode:
+            return ToolResult(
+                "gitleaks",
+                "FAIL",
+                "cannot resolve Git objects for secret scan",
+                time.monotonic() - start,
+            )
+        env["GIT_DIR"] = os.fsdecode(git_dir.stdout.rstrip(b"\n"))
+        env["GIT_WORK_TREE"] = tmpdir
+        ignore_path = str(allowlist) if has_allowlist else tmpdir
+        flags = [
+            "--no-banner",
+            "--redact=100",
+            "--exit-code=1",
+            "--log-level=warn",
+            "--ignore-gitleaks-allow",
+            f"--gitleaks-ignore-path={ignore_path}",
+        ]
+        commands = [[exe, "git", *flags, f"--log-opts={rng}", "."] for rng in ranges]
+        commands.extend(
+            [exe, "dir", *flags, str(repo_root / rel)]
+            for rel in files
+            if (repo_root / rel).is_file() and not (repo_root / rel).is_symlink()
+        )
+        codes = [
+            subprocess.run(
+                cmd,
+                cwd=tmpdir,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            for cmd in commands
+        ]
+    failed = next((code for code in codes if code), 0)
+    detail = f"secrets scan failed (exit {failed})" if failed else "secrets scan clean"
+    if has_allowlist:
+        detail += "; allowlist: .gitleaksignore"
+    return ToolResult(
+        "gitleaks", "FAIL" if failed else "PASS", detail, time.monotonic() - start
+    )
+
+
+def collect_changed_mode(
+    repo: Path, base_arg: str | None
+) -> tuple[list[str], list[str], list[str]]:
+    if base_arg:
+        base_check = run_cmd(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{base_arg}^{{commit}}",
+            ],
+            cwd=repo,
+        )
+        if base_check.returncode != 0:
+            raise RuntimeError(f"Invalid --changed base ref: {base_arg}")
+        default_ref = base_check.stdout.decode("utf-8", errors="replace").strip()
+    else:
+        default_ref = resolve_default_branch(repo)
+        if default_ref is None:
+            raise RuntimeError("No base ref provided and no default branch found")
+    base_sha = find_merge_base(repo, default_ref, "HEAD") or default_ref
+
+    committed_and_wt = git_lines_z(
+        repo, ["diff", "--name-only", "--diff-filter=d", "-z", base_sha]
+    )
+    untracked = git_lines_z(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
+    all_files = sorted(set(committed_and_wt) | set(untracked))
+
+    dirty_tracked = git_lines_z(
+        repo, ["diff", "--name-only", "--diff-filter=d", "-z", "HEAD"]
+    )
+    uncommitted = sorted(set(dirty_tracked) | set(untracked))
+    gitleaks_ranges = [f"{base_sha}..HEAD"]
+    return all_files, gitleaks_ranges, uncommitted
+
+
+def remote_head(repo: Path, remote: str) -> str | None:
+    refs = run_cmd(["git", "ls-remote", "--symref", "--", remote], cwd=repo)
+    if refs.returncode != 0:
+        raise RuntimeError(
+            "Cannot establish pre-push base: remote refs could not be read"
+        )
+    if not refs.stdout:
+        return None  # The remote has confirmed it has no refs.
+    for line in refs.stdout.decode("utf-8", errors="replace").splitlines():
+        sha, _, name = line.partition("\t")
+        if name == "HEAD" and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            return sha
+    raise RuntimeError(
+        "Cannot establish pre-push base: nonempty remote has no advertised HEAD"
+    )
+
+
+def collect_pre_push_mode(
+    repo: Path, remote: str, stdin_text: str
+) -> list[tuple[str, str, list[str], list[str]]]:
+    """Group each ref's changed files and scan range by exact tip."""
+    tips: dict[str, tuple[list[str], set[str], set[str]]] = {}
+    default_resolved = False
+    default_sha = None
+    for line in stdin_text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 4:
+            raise RuntimeError("Malformed pre-push stdin line")
+        local_ref, local_sha, remote_ref, old_sha = parts
+        if not all(
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+            for sha in (local_sha, old_sha)
+        ):
+            raise RuntimeError("Malformed pre-push object ID")
+        if local_sha == "0" * len(local_sha):
+            continue  # Ref deletion.
+        is_new_ref = old_sha == "0" * len(old_sha)
+        use_default = is_new_ref or remote_ref.startswith("refs/heads/")
+        if use_default and not default_resolved:
+            default_sha = remote_head(repo, remote)
+            default_resolved = True
+        # Secrets can appear in outgoing commits even when the final diff is clean.
+        scan_base = default_sha if is_new_ref else old_sha
+        lint_base = (default_sha or scan_base) if use_default else scan_base
+        if lint_base is None:
+            # Git knows the empty tree object even in a newly initialized repo.
+            diff_base = (
+                run_cmd(
+                    ["git", "hash-object", "-t", "tree", "--stdin"],
+                    cwd=repo,
+                    input_bytes=b"",
+                )
+                .stdout.decode()
+                .strip()
+            )
+        else:
+            merge_base = find_merge_base(repo, lint_base, local_sha)
+            if merge_base is None and use_default and default_sha is not None:
+                raise RuntimeError(
+                    "Cannot establish pre-push base: no merge base with remote HEAD; "
+                    "fetch the remote default branch and check that the histories are related"
+                )
+            diff_base = merge_base or lint_base
+        scan_range = local_sha if scan_base is None else f"{scan_base}..{local_sha}"
+        files = git_lines_z(
+            repo,
+            [
+                "diff",
+                "--name-only",
+                "--diff-filter=d",
+                "-z",
+                diff_base,
+                local_sha,
+                "--",
+            ],
+        )
+        names, changed, ranges = tips.setdefault(local_sha, ([], set(), set()))
+        names.append(local_ref)
+        changed.update(files)
+        ranges.add(scan_range)
+    return [
+        (sha, ", ".join(names), sorted(changed), sorted(ranges))
+        for sha, (names, changed, ranges) in tips.items()
+    ]
+
+
+def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
+    # Read raw Git blobs so export-ignore, export-subst and checkout filters
+    # cannot change the source the tools evaluate.
+    blobs = []
+    for entry in git_lines_z(repo, ["ls-tree", "-rz", commit_sha]):
+        header, path = entry.split("\t", 1)
+        mode, kind, oid = header.split()
+        if kind == "blob":
+            blobs.append((mode, path, oid))
+
+    with tempfile.TemporaryFile() as requests:
+        requests.write("".join(f"{oid}\n" for _, _, oid in blobs).encode("ascii"))
+        requests.seek(0)
+        with subprocess.Popen(
+            ["git", "cat-file", "--batch"],
+            cwd=repo,
+            stdin=requests,
+            stdout=subprocess.PIPE,
+        ) as proc:
+            assert proc.stdout is not None
+            try:
+                for mode, rel, oid in blobs:
+                    header = proc.stdout.readline().split()
+                    if len(header) != 3 or header[:2] != [oid.encode("ascii"), b"blob"]:
+                        raise RuntimeError(f"Failed to read snapshot object {oid}")
+                    remaining = int(header[2])
+                    path = dest / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if mode == "120000":
+                        path.symlink_to(os.fsdecode(proc.stdout.read(remaining)))
+                    else:
+                        with path.open("wb") as blob:
+                            while remaining:
+                                chunk = proc.stdout.read(min(remaining, 1024 * 1024))
+                                if not chunk:
+                                    raise RuntimeError(
+                                        f"Truncated snapshot object {oid}"
+                                    )
+                                blob.write(chunk)
+                                remaining -= len(chunk)
+                        if mode == "100755":
+                            path.chmod(0o755)
+                    if proc.stdout.read(1) != b"\n":
+                        raise RuntimeError(f"Truncated snapshot object {oid}")
+            except BaseException:
+                proc.kill()
+                raise
+            if proc.wait() != 0:
+                raise RuntimeError(f"Failed to snapshot {commit_sha}")
+
+    # Supply installed dependencies while keeping the source and configs at the tip.
+    package_dirs = {Path(".")}
+    package_dirs.update(
+        Path(rel).parent for _, rel, _ in blobs if Path(rel).name == "package.json"
+    )
+    for package in package_dirs:
+        deps = package / "node_modules"
+        if (repo / deps).is_dir() and not os.path.lexists(dest / deps):
+            (dest / deps).symlink_to(repo / deps, target_is_directory=True)
+
+
+def create_log_path(repo_root: Path) -> Path:
+    base = os.environ.get("AZ_LINT_LOG_DIR")
+    if base:
+        log_dir = Path(base)
+    else:
+        state_home = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+        )
+        log_dir = state_home / "az-lint"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        log_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "az-lint"
+        log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  # noqa: UP017
+    return log_dir / f"{repo_root.name}-{stamp}-{os.getpid()}.log"
+
+
+def classify_files(files: list[str], work_root: Path) -> dict[str, list[str]]:
+    buckets: dict[str, list[str]] = {tid: [] for tid in ALL_TOOL_IDS}
+    for rel in files:
+        if not (work_root / rel).is_file() or (work_root / rel).is_symlink():
+            continue
+        ext = PurePosixPath(rel).suffix.lower()
+        if ext in RUST_EXTS:
+            buckets["cargo-fmt"].append(rel)
+            buckets["cargo-clippy"].append(rel)
+        elif ext in PY_EXTS:
+            buckets["ruff-check"].append(rel)
+            buckets["ruff-format"].append(rel)
+        elif ext in SH_EXTS:
+            buckets["shellcheck"].append(rel)
+            buckets["shfmt"].append(rel)
+        elif ext in YAML_EXTS:
+            buckets["yamllint"].append(rel)
+            if is_workflow_file(rel):
+                buckets["actionlint"].append(rel)
+        elif ext in JS_TS_EXTS:
+            buckets["biome"].append(rel)
+            buckets["tsc"].append(rel)
+        elif ext in SQL_EXTS:
+            buckets["sqlfluff"].append(rel)
+        elif ext in VERILOG_EXTS:
+            buckets["verible-lint"].append(rel)
+            buckets["verible-format"].append(rel)
+            buckets["verilator"].append(rel)
+        elif ext in C_CPP_EXTS:
+            buckets["clang-format"].append(rel)
+            buckets["cppcheck"].append(rel)
+        buckets["semgrep"].append(rel)
+    return buckets
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Clear git hook env vars before running git discovery so worktrees/subprocesses behave cleanly.
+    for var in GIT_HOOK_ENV_VARS:
+        os.environ.pop(var, None)
+
+    parser = argparse.ArgumentParser(
+        prog="az-lint",
+        description="Run repository linters on changed files.",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--changed",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="BASE",
+        help="Lint files changed from the merge base with BASE (default: remote default branch).",
+    )
+    mode.add_argument(
+        "--pre-push",
+        action="store_true",
+        help="Read git pre-push refs from stdin and lint the pushed range.",
+    )
+    parser.add_argument(
+        "--remote",
+        default=os.environ.get("AZ_LINT_REMOTE", "origin"),
+        help="Remote name for --pre-push new-branch comparison (default: origin).",
+    )
+    parser.add_argument("--remote-url", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Repository directory (default: current directory).",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional path to .az-lint.toml (default: <repo>/.az-lint.toml).",
+    )
+    args = parser.parse_args(argv)
+
+    target = Path(args.repo).resolve()
+    top_res = run_cmd(
+        ["git", "-C", str(target), "rev-parse", "--show-toplevel"], cwd=target
+    )
+    if top_res.returncode != 0:
+        sys.stderr.write(f"az-lint: not a git repository: {target}\n")
+        return 2
+    repo_root = Path(top_res.stdout.decode("utf-8", errors="replace").strip()).resolve()
+
+    explicit_config = Path(args.config).resolve() if args.config else None
+    t_start = time.monotonic()
+    groups: list[tuple[str, int, int, list[ToolResult]]] = []
+
+    def lint_tree(
+        label: str,
+        work_root: Path,
+        changed: list[str],
+        ranges: list[str],
+        uncommitted: list[str],
+    ) -> None:
+        lint_cfg = load_config(explicit_config or work_root / ".az-lint.toml")
+        included = [f for f in changed if not is_excluded(f, lint_cfg.global_exclude)]
+        buckets = classify_files(included, work_root)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(
+                    execute_tool,
+                    tid,
+                    lint_cfg.tools[tid],
+                    buckets[tid],
+                    work_root,
+                    repo_root,
+                    ranges,
+                    uncommitted,
+                )
+                for tid in ALL_TOOL_IDS
+            ]
+            results = [future.result() for future in futures]
+        groups.append((label, len(changed), len(included), results))
+
+    try:
+        if args.pre_push:
+            remote = args.remote_url or args.remote
+            tips = collect_pre_push_mode(repo_root, remote, sys.stdin.read())
+            if not tips:
+                lint_tree("", repo_root, [], [], [])
+            for sha, refs, changed, ranges in tips:
+                with tempfile.TemporaryDirectory(prefix="az-lint-snap-") as snapshot:
+                    work_root = Path(snapshot)
+                    materialize_snapshot(repo_root, sha, work_root)
+                    lint_tree(f"[{refs} {sha[:12]}]", work_root, changed, ranges, [])
+        else:
+            changed, ranges, uncommitted = collect_changed_mode(
+                repo_root, args.changed or None
+            )
+            lint_tree("", repo_root, changed, ranges, uncommitted)
+    except (ConfigError, OSError, RuntimeError) as exc:
+        sys.stderr.write(f"az-lint: {exc}\n")
+        return 2
+
+    total_elapsed = time.monotonic() - t_start
+    clippy_elapsed = sum(
+        r.elapsed
+        for _, _, _, results in groups
+        for r in results
+        if r.tool_id == "cargo-clippy" and r.status != "SKIP"
+    )
+    non_clippy_elapsed = max(0.0, total_elapsed - clippy_elapsed)
+    safe_output = all(
+        r.status in ("PASS", "SKIP")
+        for _, _, _, results in groups
+        for r in results
+        if r.tool_id == "gitleaks"
+    )
+    log_path = create_log_path(repo_root)
+    log_lines = [
+        f"az-lint repo={repo_root} mode={'pre-push' if args.pre_push else 'changed'}"
+    ]
+    if not safe_output:
+        log_lines.append("Tool output withheld because the secret scan did not pass.")
+    has_fail = False
+    has_missing = False
+    for label, changed_count, included_count, results in groups:
+        log_lines.append(
+            f"{label} changed_files={changed_count} included_files={included_count}"
+        )
+        for r in results:
+            detail = f"{r.detail} {label}".rstrip()
+            print(f"{r.tool_id:<15} {r.status:<7} {detail} ({r.elapsed:.2f}s)")
+            log_lines.append(
+                f"=== {r.tool_id} [{r.status}] ({r.elapsed:.2f}s) {detail} ==="
+            )
+            if safe_output and r.output:
+                log_lines.append(r.output)
+            if safe_output and r.advisory_stdout:
+                print(f"--- {r.tool_id} advisory findings ---")
+                print(r.advisory_stdout)
+                print(f"--- end {r.tool_id} ---")
+            if r.blocking:
+                has_fail |= r.status == "FAIL"
+                has_missing |= r.status == "MISSING"
+
+    with os.fdopen(
+        os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+        "w",
+        encoding="utf-8",
+        errors="backslashreplace",
+    ) as log:
+        log.write("\n".join(log_lines) + "\n")
+    if not safe_output:
+        print("Tool output withheld because the secret scan did not pass.")
+    print(
+        f"elapsed: {total_elapsed:.2f}s (excluding cargo-clippy: {non_clippy_elapsed:.2f}s)"
+    )
+    print(f"log: {log_path}")
+
+    if has_fail:
+        return 1
+    if has_missing:
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

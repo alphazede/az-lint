@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Git exports repository paths during hook execution; clear them so az-lint
+# resolves the current checkout or linked worktree cleanly.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_COMMON_DIR \
+	GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+	GIT_IMPLICIT_WORK_TREE GIT_GRAFT_FILE GIT_SHALLOW_FILE \
+	GIT_INTERNAL_SUPER_PREFIX
+
+REMOTE_NAME="${1:-origin}"
+SELF_PATH=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname -- "$SELF_PATH")
+
+exec "$SCRIPT_DIR/az-lint" --pre-push --remote "$REMOTE_NAME" --remote-url "${2:-}"
