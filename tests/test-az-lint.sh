@@ -914,6 +914,16 @@ fallback_log=$(sed -n 's/^log: //p' "$WORK/log-fallback.out")
 assert_rc "11 fallback directory is private" 700 "$(stat -c '%a' "${fallback_log%/*}")" "$WORK/log-fallback.out"
 assert_rc "11 fallback log is private" 600 "$(stat -c '%a' "$fallback_log")" "$WORK/log-fallback.out"
 
+AZ_LINT_LOG_DIR="$UNTRUSTED/local-logs" TMPDIR="$WORK/fallback-tmp" \
+	"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD >"$WORK/untrusted-log.out" 2>&1
+assert_rc "11 untrusted log falls back outside the checkout" 0 "$?" "$WORK/untrusted-log.out"
+untrusted_log=$(sed -n 's/^log: //p' "$WORK/untrusted-log.out")
+if [[ "$untrusted_log" == "$WORK/fallback-tmp/az-lint-"* && ! -e "$UNTRUSTED/local-logs" ]]; then
+	ok "11 untrusted log destination leaves checkout untouched"
+else
+	fail "11 untrusted log destination" "expected a private temporary log outside the checkout" "$WORK/untrusted-log.out"
+fi
+
 printf '[tools.semgrep]\noverride_args = ["scan", "--config", ".semgrep.yml", "--error"]\n' \
 	>"$WORK/semgrep-override.toml"
 "$AZ_LINT" --repo "$REPO" --changed main --config "$WORK/semgrep-override.toml" \

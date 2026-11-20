@@ -1491,7 +1491,7 @@ def materialize_snapshot(
             (dest / deps).symlink_to(repo / deps, target_is_directory=True)
 
 
-def create_log_path(repo_root: Path) -> Path:
+def create_log_path(repo_root: Path, untrusted: bool) -> Path:
     base = os.environ.get("AZ_LINT_LOG_DIR")
     if base:
         log_dir = Path(base)
@@ -1501,6 +1501,13 @@ def create_log_path(repo_root: Path) -> Path:
         )
         log_dir = state_home / "az-lint"
     try:
+        if untrusted:
+            absolute = log_dir.absolute()
+            log_dir = absolute.resolve()
+            if absolute != log_dir or log_dir.is_relative_to(repo_root):
+                raise OSError(
+                    "untrusted mode requires a log directory outside the checkout"
+                )
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         log_dir = Path(tempfile.mkdtemp(prefix="az-lint-"))
@@ -1740,7 +1747,7 @@ def main(argv: list[str] | None = None) -> int:
         for r in results
         if r.tool_id == "gitleaks"
     )
-    log_path = create_log_path(repo_root)
+    log_path = create_log_path(repo_root, args.untrusted)
     log_lines = [
         f"az-lint repo={repo_root} mode={'pre-push' if args.pre_push else 'changed'}"
     ]
