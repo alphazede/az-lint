@@ -1100,22 +1100,33 @@ def execute_tool(
                 elapsed=time.monotonic() - t0,
                 blocking=False,
             )
-        cmd = (
-            [exe, *cfg.override_args, *operands]
+        scan_args = (
+            cfg.override_args
             if cfg.override_args is not None
-            else [
-                exe,
-                "scan",
-                *cfg_args,
-                "--metrics",
-                "off",
-                "--disable-version-check",
-                "--error",
-                *extra_args,
-                *operands,
-            ]
+            else ["scan", *cfg_args, "--error", *extra_args]
         )
-        res = run_cmd(cmd, cwd=work_root)
+        end = scan_args.index("--") if "--" in scan_args else len(scan_args)
+        options = iter(scan_args[:end])
+        fixed_args = []
+        for arg in options:
+            if arg == "--metrics":
+                next(options, None)
+            elif not arg.startswith("--metrics=") and arg not in (
+                "--enable-version-check",
+                "--disable-version-check",
+            ):
+                fixed_args.append(arg)
+        cmd = [
+            exe,
+            *fixed_args,
+            "--metrics",
+            "off",
+            "--disable-version-check",
+            *scan_args[end:],
+            *operands,
+        ]
+        env = {**os.environ, "SEMGREP_SEND_METRICS": "off"}
+        res = run_cmd(cmd, cwd=work_root, env=env)
         stdout_text = res.stdout.decode("utf-8", errors="replace").strip()
         stderr_text = res.stderr.decode("utf-8", errors="replace").strip()
         combined = "\n".join(part for part in (stdout_text, stderr_text) if part)

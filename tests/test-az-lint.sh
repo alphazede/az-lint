@@ -891,6 +891,16 @@ fallback_log=$(sed -n 's/^log: //p' "$WORK/log-fallback.out")
 assert_rc "11 fallback directory is private" 700 "$(stat -c '%a' "${fallback_log%/*}")" "$WORK/log-fallback.out"
 assert_rc "11 fallback log is private" 600 "$(stat -c '%a' "$fallback_log")" "$WORK/log-fallback.out"
 
+printf '[tools.semgrep]\noverride_args = ["scan", "--config", ".semgrep.yml", "--error"]\n' \
+	>"$WORK/semgrep-override.toml"
+"$AZ_LINT" --repo "$REPO" --changed main --config "$WORK/semgrep-override.toml" \
+	>"$WORK/semgrep-offline.out" 2>&1
+assert_grep "12 Semgrep scan with overrides reports findings" \
+	'^semgrep[[:space:]]+FAIL.*findings printed' "$WORK/semgrep-offline.out"
+semgrep_log=$(sed -n 's/^log: //p' "$WORK/semgrep-offline.out")
+assert_grep "12 Semgrep overrides keep version checks and metrics off" \
+	'^\$ .*semgrep .*--metrics off --disable-version-check' "$semgrep_log"
+
 HOOK_REPO="$WORK/hook-source"
 HOOK_WT="$WORK/hook-worktree"
 new_repo "$HOOK_REPO"
