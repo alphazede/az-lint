@@ -1039,9 +1039,22 @@ def execute_tool(
             pkg_dir = find_package_typecheck(work_root / rel, work_root)
             if pkg_dir is not None:
                 packages.setdefault(pkg_dir, []).append(rel)
+        # Plain tsc searches upward from the package for tsconfig.json.
+        packages = {
+            pkg_dir: files
+            for pkg_dir, files in packages.items()
+            if any(
+                (directory / "tsconfig.json").is_file()
+                for directory in (pkg_dir, *pkg_dir.parents)
+                if directory.is_relative_to(work_root)
+            )
+        }
         if not packages:
             return ToolResult(
-                tool_id, "SKIP", "no typecheck script defined", time.monotonic() - t0
+                tool_id,
+                "SKIP",
+                "no package with a typecheck script and a reachable tsconfig.json",
+                time.monotonic() - t0,
             )
         log_chunks = []
         worst_rc = 0
