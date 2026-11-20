@@ -1243,7 +1243,7 @@ def scan_secrets(
             "--no-banner",
             "--redact=100",
             "--exit-code=1",
-            "--log-level=warn",
+            "--log-level=error" if untrusted else "--log-level=warn",
             "--ignore-gitleaks-allow",
             f"--gitleaks-ignore-path={ignore_path}",
         ]
@@ -1265,19 +1265,28 @@ def scan_secrets(
             and not (repo_root / rel).is_symlink()
             and (not untrusted or (repo_root / rel).resolve() == repo_root / rel)
         )
-        codes = [
+        results = [
             subprocess.run(
                 cmd,
                 cwd=tmpdir,
                 env=env,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE if untrusted else subprocess.DEVNULL,
                 check=False,
-            ).returncode
+            )
             for cmd in commands
         ]
-    failed = next((code for code in codes if code), 0)
-    detail = f"secrets scan failed (exit {failed})" if failed else "secrets scan clean"
+    # Gitleaks can log a Git error and still exit successfully.
+    failed = next(
+        (res for res in results if res.returncode or (untrusted and res.stderr)),
+        None,
+    )
+    if failed is None:
+        detail = "secrets scan clean"
+    elif failed.returncode:
+        detail = f"secrets scan failed (exit {failed.returncode})"
+    else:
+        detail = "secrets scan incomplete (scanner reported an error)"
     if has_allowlist:
         detail += "; allowlist: .gitleaksignore"
     return ToolResult(

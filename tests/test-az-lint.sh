@@ -866,7 +866,8 @@ fi
 git -C "$UNTRUSTED" config format.pretty invalid-fixture-format
 GIT_TRACE="$WORK/untrusted-git.trace" "$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD^ \
 	>"$WORK/untrusted-git-settings.out" 2>&1
-assert_tool_status "10 untrusted Git presentation settings" PASS "$WORK/untrusted-git-settings.out" gitleaks
+assert_rc "10 untrusted Git history error blocks the run" 1 "$?" "$WORK/untrusted-git-settings.out"
+assert_tool_status "10 untrusted Git history error" FAIL "$WORK/untrusted-git-settings.out" gitleaks
 if [[ -e "$WORK/untrusted-git.trace" ]]; then
 	fail "10 untrusted Git writes only runner logs" "Git tracing wrote a separate file"
 else
