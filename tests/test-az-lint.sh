@@ -924,6 +924,30 @@ for mode in executable non-executable; do
 	done
 done
 
+printf 'x = 1\n' >"$MODES/kept.py"
+printf 'x = 2\n' >"$MODES/gone.py"
+python3 - "$AZ_LINT" "$MODES" >"$WORK/staging-race.out" 2>&1 <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+runner, repo = sys.argv[1:]
+main = runpy.run_path(runner)["main"]
+classify = main.__globals__["classify_files"]
+
+def classify_then_remove(*args):
+    result = classify(*args)
+    (Path(repo) / "gone.py").unlink()
+    return result
+
+main.__globals__["classify_files"] = classify_then_remove
+raise SystemExit(main(["--untrusted", "--repo", repo, "--changed", "HEAD"]))
+PY
+assert_rc "untrusted staging skips a file removed after classification" 0 "$?" "$WORK/staging-race.out"
+assert_grep "untrusted staging reports the skipped input" '^az-lint: skipped 1 ' "$WORK/staging-race.out"
+assert_grep "untrusted staging still checks the remaining file" '^ruff-check[[:space:]]+PASS[[:space:]]+1 file\(s\)' "$WORK/staging-race.out"
+assert_tool_status "untrusted staging still scans for secrets" PASS "$WORK/staging-race.out" gitleaks
+
 printf '#!/bin/sh\nexit 0\n' >"$UNTRUSTED/"$'-script with spaces\nand newline.sh'
 save_commit "$UNTRUSTED"
 UNTRUSTED_TIP=$(git -C "$UNTRUSTED" rev-parse HEAD)
