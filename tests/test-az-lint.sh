@@ -67,7 +67,7 @@ ALL_TOOLS=("${LANGUAGE_TOOLS[@]}" gitleaks semgrep)
 RESTRICTED_BIN="$WORK/restricted-bin"
 STUB_BIN="$WORK/stub-bin"
 mkdir -p "$RESTRICTED_BIN" "$STUB_BIN"
-for cmd in bash cat chmod date dirname env git git-receive-pack grep ln mkdir mktemp mv python3 rm sed sh stat tail tar; do
+for cmd in bash cat chmod cp date dirname env git git-receive-pack grep ln mkdir mktemp mv python3 rm sed sh stat tail tar touch; do
 	p=$(type -P "$cmd") || {
 		printf 'FATAL: self-test requires %s\n' "$cmd" >&2
 		exit 2
@@ -449,6 +449,12 @@ else
 fi
 grep -E '^elapsed:' "$WORK/clean.out" || true
 
+"$AZ_LINT" --untrusted --repo "$REPO" --changed main >"$WORK/clean-untrusted.out" 2>&1
+assert_rc "10 all-language clean in untrusted mode" 0 "$?" "$WORK/clean-untrusted.out"
+assert_tool_status "10 clean untrusted tools" PASS "$WORK/clean-untrusted.out" \
+	ruff-check ruff-format shellcheck shfmt actionlint yamllint biome sqlfluff \
+	verible-lint verible-format clang-format cppcheck gitleaks
+
 mv "$REPO/web/node_modules" "$WORK/web-node-modules"
 PATH="$RESTRICTED_BIN" "$AZ_LINT" --repo "$REPO" --changed main >"$WORK/missing.out" 2>&1
 rc=$?
@@ -799,6 +805,149 @@ assert_tool_status "9 Actionlint config with parser" PASS "$WORK/actionlint.out"
 python3 -ES "$AZ_LINT" --repo "$FIX" --changed "$ACTION_BASE" >"$WORK/actionlint-no-yaml.out" 2>&1
 assert_rc "9 missing YAML parser is an explicit prerequisite" 3 "$?" "$WORK/actionlint-no-yaml.out"
 assert_grep "9 Actionlint names the missing parser" '^actionlint[[:space:]]+MISSING.*PyYAML' "$WORK/actionlint-no-yaml.out"
+
+UNTRUSTED="$WORK/untrusted"
+new_repo "$UNTRUSTED"
+git -C "$UNTRUSTED" commit -qm base --allow-empty
+mkdir -p "$UNTRUSTED/node_modules/.bin" "$UNTRUSTED/src" "$WORK/tool-links"
+printf '#!/bin/sh\nprintf ran > "%s"\n' "$WORK/checkout-tool-ran" \
+	>"$UNTRUSTED/node_modules/.bin/biome"
+cp "$UNTRUSTED/node_modules/.bin/biome" "$UNTRUSTED/node_modules/.bin/tsc"
+cp "$UNTRUSTED/node_modules/.bin/biome" "$UNTRUSTED/node_modules/.bin/ruff"
+chmod +x "$UNTRUSTED/node_modules/.bin/"*
+ln -s "$UNTRUSTED/node_modules/.bin/ruff" "$WORK/tool-links/ruff"
+printf '/node_modules/\n' >>"$UNTRUSTED/.git/info/exclude"
+printf '{"scripts":{"typecheck":"tsc --noEmit"}}\n' >"$UNTRUSTED/package.json"
+printf '[tools]\nruff = false\n' >"$UNTRUSTED/.az-lint.toml"
+printf 'x = 1\n' >"$UNTRUSTED/clean.py"
+printf '*.py filter=marker\n' >"$UNTRUSTED/.gitattributes"
+printf '#!/bin/sh\nprintf ran > "%s"\ncat\n' "$WORK/git-filter-ran" \
+	>"$UNTRUSTED/node_modules/.bin/clean-filter"
+chmod +x "$UNTRUSTED/node_modules/.bin/clean-filter"
+git -C "$UNTRUSTED" config filter.marker.clean ./node_modules/.bin/clean-filter
+git -C "$UNTRUSTED" config filter.marker.required true
+git -C "$UNTRUSTED" add .gitattributes clean.py
+git -C "$UNTRUSTED" commit -qm "file with a Git clean filter"
+if [[ -e "$WORK/git-filter-ran" ]]; then
+	ok "10 Git can execute the configured clean filter"
+	rm "$WORK/git-filter-ran"
+else
+	fail "10 Git clean filter fixture" "expected the filter to create a marker"
+fi
+printf 'x = 2\n' >"$UNTRUSTED/clean.py"
+printf 'export const answer = 42;\n' >"$UNTRUSTED/clean.js"
+printf 'fn main() {}\n' >"$UNTRUSTED/src/main.rs"
+printf '[package]\nname = "fixture"\nversion = "0.1.0"\n' >"$UNTRUSTED/Cargo.toml"
+printf '#!/bin/sh\nexit 0\n' >"$UNTRUSTED/scan.sh"
+git -C "$REPO" show feat/violations:bad.yaml >"$UNTRUSTED/bad.yaml"
+printf 'extends: default\nrules:\n  key-duplicates: disable\n' >"$UNTRUSTED/.yamllint"
+mkdir "$WORK/external"
+printf 'import unused\n' >"$WORK/external/outside.py"
+ln -s "$WORK/external" "$UNTRUSTED/linked"
+PATH="$UNTRUSTED/node_modules/.bin:$WORK/tool-links:$PATH" \
+	"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD >"$WORK/untrusted.out" 2>&1
+assert_rc "10 untrusted ignores checkout yamllint config and rejects duplicate keys" 1 "$?" "$WORK/untrusted.out"
+assert_tool_status "10 untrusted fixed checks" PASS "$WORK/untrusted.out" ruff-check ruff-format gitleaks
+assert_tool_status "10 untrusted YAML" FAIL "$WORK/untrusted.out" yamllint
+assert_tool_status "10 untrusted project-dependent checks" SKIP "$WORK/untrusted.out" cargo-fmt cargo-clippy tsc semgrep
+assert_grep "10 untrusted clippy skip explains why" '^cargo-clippy[[:space:]]+SKIP.*build scripts' "$WORK/untrusted.out"
+if [[ -e "$WORK/checkout-tool-ran" || -e "$WORK/git-filter-ran" ]]; then
+	fail "10 untrusted scripts stay inert" "a checkout binary or Git filter ran" "$WORK/untrusted.out"
+else
+	ok "10 untrusted scripts stay inert"
+fi
+
+rm "$UNTRUSTED/bad.yaml"
+if [[ " ${REAL_TOOLS[*]} " == *" shellcheck "* ]]; then
+	SHELLCHECK_OPTS=--shell=invalid "$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD \
+		>"$WORK/untrusted-shellcheck-env.out" 2>&1
+	assert_tool_status "10 untrusted ignores caller ShellCheck options" PASS "$WORK/untrusted-shellcheck-env.out" shellcheck
+fi
+git -C "$UNTRUSTED" config format.pretty invalid-fixture-format
+GIT_TRACE="$WORK/untrusted-git.trace" "$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD^ \
+	>"$WORK/untrusted-git-settings.out" 2>&1
+assert_rc "10 untrusted Git history error blocks the run" 1 "$?" "$WORK/untrusted-git-settings.out"
+assert_tool_status "10 untrusted Git history error" FAIL "$WORK/untrusted-git-settings.out" gitleaks
+if [[ -e "$WORK/untrusted-git.trace" ]]; then
+	fail "10 untrusted Git writes only runner logs" "Git tracing wrote a separate file"
+else
+	ok "10 untrusted ignores ambient Git tracing"
+fi
+git -C "$UNTRUSTED" config --unset format.pretty
+printf '[tools.ruff-check]\noverride_args = ["check", "--fix"]\n' >"$WORK/trusted.toml"
+AZ_LINT_UNTRUSTED=1 "$AZ_LINT" --repo "$UNTRUSTED" --changed HEAD \
+	--config "$WORK/trusted.toml" >"$WORK/untrusted-env.out" 2>&1
+assert_rc "10 environment switch accepts external config" 0 "$?" "$WORK/untrusted-env.out"
+assert_grep "10 untrusted refuses argument overrides" '^ruff-check[[:space:]]+SKIP.*custom arguments' "$WORK/untrusted-env.out"
+ln -s "$UNTRUSTED/.az-lint.toml" "$WORK/linked.toml"
+"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD \
+	--config "$WORK/linked.toml" >"$WORK/untrusted-config.out" 2>&1
+assert_rc "10 untrusted rejects config symlink into checkout" 2 "$?" "$WORK/untrusted-config.out"
+assert_grep "10 untrusted config explains rejection" 'config.*outside.*checkout' "$WORK/untrusted-config.out"
+
+printf '#!/bin/sh\nexit 0\n' >"$UNTRUSTED/"$'-script with spaces\nand newline.sh'
+save_commit "$UNTRUSTED"
+UNTRUSTED_TIP=$(git -C "$UNTRUSTED" rev-parse HEAD)
+printf 'refs/heads/main %s refs/heads/main %s\n' "$UNTRUSTED_TIP" "$ZERO" |
+	"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --pre-push >"$WORK/untrusted-names.out" 2>&1
+assert_rc "10 untrusted pre-push accepts spaces, newlines and leading dashes" 0 "$?" "$WORK/untrusted-names.out"
+assert_grep "10 untrusted pre-push checks both shell files" '^shellcheck[[:space:]]+PASS[[:space:]]+2 file\(s\)' "$WORK/untrusted-names.out"
+
+git -C "$FIX" show "$TIP^:leak.txt" >"$UNTRUSTED/leak.txt"
+save_commit "$UNTRUSTED"
+UNTRUSTED_TIP=$(git -C "$UNTRUSTED" rev-parse HEAD)
+printf '%s:leak.txt:github-pat:1\n' "$UNTRUSTED_TIP" >"$UNTRUSTED/.gitleaksignore"
+"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD^ >"$WORK/untrusted-leak.out" 2>&1
+assert_rc "10 untrusted detects secret despite checkout allowlist" 1 "$?" "$WORK/untrusted-leak.out"
+assert_tool_status "10 untrusted secrets remain blocking" FAIL "$WORK/untrusted-leak.out" gitleaks
+printf 'refs/heads/main %s refs/heads/main %s\n' "$UNTRUSTED_TIP" "$ZERO" |
+	"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --pre-push --remote-url "$WORK/absent" \
+		>"$WORK/untrusted-push.out" 2>&1
+assert_rc "10 untrusted pre-push scans without remote access" 1 "$?" "$WORK/untrusted-push.out"
+assert_tool_status "10 untrusted pre-push still detects secret" FAIL "$WORK/untrusted-push.out" gitleaks
+
+mkdir "$WORK/fallback-tmp"
+touch "$WORK/state-collision"
+AZ_LINT_LOG_DIR="$WORK/state-collision/az-lint" TMPDIR="$WORK/fallback-tmp" \
+	"$AZ_LINT" --repo "$FIX" --changed HEAD >"$WORK/log-fallback.out" 2>&1
+assert_rc "11 log directory failure falls back successfully" 0 "$?" "$WORK/log-fallback.out"
+fallback_log=$(sed -n 's/^log: //p' "$WORK/log-fallback.out")
+assert_rc "11 fallback directory is private" 700 "$(stat -c '%a' "${fallback_log%/*}")" "$WORK/log-fallback.out"
+assert_rc "11 fallback log is private" 600 "$(stat -c '%a' "$fallback_log")" "$WORK/log-fallback.out"
+
+AZ_LINT_LOG_DIR="$UNTRUSTED/local-logs" TMPDIR="$WORK/fallback-tmp" \
+	"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD >"$WORK/untrusted-log.out" 2>&1
+assert_rc "11 untrusted log falls back outside the checkout" 0 "$?" "$WORK/untrusted-log.out"
+untrusted_log=$(sed -n 's/^log: //p' "$WORK/untrusted-log.out")
+if [[ "$untrusted_log" == "$WORK/fallback-tmp/az-lint-"* && ! -e "$UNTRUSTED/local-logs" ]]; then
+	ok "11 untrusted log destination leaves checkout untouched"
+else
+	fail "11 untrusted log destination" "expected a private temporary log outside the checkout" "$WORK/untrusted-log.out"
+fi
+
+WHITESPACE_REPO="$WORK/"$'checkout with trailing whitespace \n'
+new_repo "$WHITESPACE_REPO"
+git -C "$WHITESPACE_REPO" commit -qm base --allow-empty
+printf '#!/bin/sh\nexit 0\n' >"$WHITESPACE_REPO/scan.sh"
+"$AZ_LINT" --untrusted --repo "$WHITESPACE_REPO" --changed HEAD >"$WORK/untrusted-root-name.out" 2>&1
+assert_rc "11 untrusted checkout name can end in whitespace" 0 "$?" "$WORK/untrusted-root-name.out"
+assert_tool_status "11 untrusted checkout with whitespace" PASS "$WORK/untrusted-root-name.out" shellcheck gitleaks
+whitespace_log=$(sed -n 's/^log: //p' "$WORK/untrusted-root-name.out")
+if [[ -f "$whitespace_log" ]]; then
+	ok "11 untrusted checkout with whitespace prints a usable log path"
+else
+	fail "11 untrusted checkout log path" "expected a single usable path" "$WORK/untrusted-root-name.out"
+fi
+
+printf '[tools.semgrep]\noverride_args = ["scan", "--config", ".semgrep.yml", "--error"]\n' \
+	>"$WORK/semgrep-override.toml"
+"$AZ_LINT" --repo "$REPO" --changed main --config "$WORK/semgrep-override.toml" \
+	>"$WORK/semgrep-offline.out" 2>&1
+assert_grep "12 Semgrep scan with overrides reports findings" \
+	'^semgrep[[:space:]]+FAIL.*findings printed' "$WORK/semgrep-offline.out"
+semgrep_log=$(sed -n 's/^log: //p' "$WORK/semgrep-offline.out")
+assert_grep "12 Semgrep overrides keep version checks and metrics off" \
+	'^\$ .*semgrep .*--metrics off --disable-version-check' "$semgrep_log"
 
 HOOK_REPO="$WORK/hook-source"
 HOOK_WT="$WORK/hook-worktree"

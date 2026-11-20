@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -72,6 +73,29 @@ ALL_TOOL_IDS = (
     "gitleaks",
     "semgrep",
 )
+
+UNTRUSTED_TOOLS = {
+    "ruff-check",
+    "ruff-format",
+    "shellcheck",
+    "shfmt",
+    "actionlint",
+    "yamllint",
+    "biome",
+    "sqlfluff",
+    "verible-lint",
+    "verible-format",
+    "clang-format",
+    "cppcheck",
+    "gitleaks",
+}
+UNTRUSTED_SKIP_REASONS = {
+    "cargo-fmt": "requires the Cargo workspace and toolchain configuration",
+    "cargo-clippy": "can run build scripts",
+    "tsc": "requires a checkout-local compiler",
+    "verilator": "requires the HDL project and its include paths",
+    "semgrep": "rules from the checkout are untrusted",
+}
 
 GROUP_ALIASES = {
     "rust": ("cargo-fmt", "cargo-clippy"),
@@ -328,6 +352,76 @@ def is_excluded(rel_path: str, patterns: list[str]) -> bool:
     return any(path_matches_pattern(rel_path, pat) for pat in patterns)
 
 
+def set_git_options(options: dict[str, str]) -> None:
+    index = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+    for key, value in options.items():
+        os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+        index += 1
+    os.environ["GIT_CONFIG_COUNT"] = str(index)
+
+
+def restrict_untrusted_environment(target: Path) -> Path:
+    # Resolve checkout-relative PATH entries before starting even the first Git process.
+    checkout = next(
+        (p for p in (target, *target.parents) if (p / ".git").exists()), target
+    )
+    binaries = (
+        "git",
+        "sh",
+        "bash",
+        "node",
+        "python",
+        "python3",
+        "ruff",
+        "shellcheck",
+        "shfmt",
+        "actionlint",
+        "yamllint",
+        "biome",
+        "sqlfluff",
+        "verible-verilog-lint",
+        "verible-verilog-format",
+        "clang-format",
+        "cppcheck",
+        "gitleaks",
+    )
+    path = []
+    for entry in os.get_exec_path():
+        directory = Path(entry)
+        if not directory.is_absolute() or directory.resolve().is_relative_to(checkout):
+            continue
+        if any(
+            (directory / name).resolve().is_relative_to(checkout) for name in binaries
+        ):
+            continue
+        path.append(entry)
+    os.environ["PATH"] = os.pathsep.join(path)
+    if shutil.which("git") is None:
+        raise RuntimeError("untrusted mode requires Git on a trusted PATH")
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            del os.environ[key]
+    os.environ.update(
+        GIT_ALLOW_PROTOCOL="",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_NO_LAZY_FETCH="1",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_OPTIONAL_LOCKS="0",
+        GIT_TERMINAL_PROMPT="0",
+    )
+    set_git_options(
+        {
+            "core.fsmonitor": "false",
+            "core.hooksPath": os.devnull,
+            "diff.mnemonicPrefix": "false",
+            "log.showSignature": "false",
+        }
+    )
+    return checkout
+
+
 def run_cmd(
     cmd: list[str],
     cwd: Path,
@@ -533,6 +627,8 @@ def execute_tool(
     repo_root: Path,
     gitleaks_ranges: list[str],
     uncommitted_files: list[str],
+    untrusted: bool,
+    tool_env: dict[str, str] | None,
 ) -> ToolResult:
     t0 = time.monotonic()
     blocking = tool_id != "semgrep"
@@ -551,8 +647,10 @@ def execute_tool(
         f
         for f in files
         if not is_excluded(f, tool_excludes)
-        and (work_root / f).is_file()
-        and not (work_root / f).is_symlink()
+        and (
+            untrusted
+            or ((work_root / f).is_file() and not (work_root / f).is_symlink())
+        )
     ]
 
     if tool_id != "gitleaks" and not filtered_files:
@@ -562,6 +660,22 @@ def execute_tool(
             detail="no matching files",
             elapsed=time.monotonic() - t0,
             blocking=blocking,
+        )
+
+    if untrusted and (
+        tool_id not in UNTRUSTED_TOOLS or cfg.args or cfg.override_args is not None
+    ):
+        reason = (
+            UNTRUSTED_SKIP_REASONS.get(tool_id, "no approved offline invocation")
+            if tool_id not in UNTRUSTED_TOOLS
+            else "custom arguments are disabled"
+        )
+        return ToolResult(
+            tool_id,
+            "SKIP",
+            f"untrusted mode: {reason}",
+            time.monotonic() - t0,
+            blocking,
         )
 
     extra_args = cfg.args or []
@@ -590,7 +704,7 @@ def execute_tool(
         if per_file:
             for rel in operands:
                 cmd = [*cmd_prefix, rel]
-                res = run_cmd(cmd, cwd=work_root)
+                res = run_cmd(cmd, cwd=work_root, env=tool_env)
                 out = (
                     res.stdout.decode("utf-8", errors="replace")
                     + res.stderr.decode("utf-8", errors="replace")
@@ -602,7 +716,7 @@ def execute_tool(
                     worst_rc = res.returncode
         else:
             cmd = [*cmd_prefix, *operands]
-            res = run_cmd(cmd, cwd=work_root)
+            res = run_cmd(cmd, cwd=work_root, env=tool_env)
             out = (
                 res.stdout.decode("utf-8", errors="replace")
                 + res.stderr.decode("utf-8", errors="replace")
@@ -625,15 +739,19 @@ def execute_tool(
         )
 
     if tool_id == "ruff-check":
-        return run_simple("ruff", ["ruff", "check"])
+        flags = ["--isolated", "--no-cache"] if untrusted else []
+        return run_simple("ruff", ["ruff", "check", *flags])
     if tool_id == "ruff-format":
-        return run_simple("ruff", ["ruff", "format", "--check"])
+        flags = ["--isolated", "--no-cache"] if untrusted else []
+        return run_simple("ruff", ["ruff", "format", "--check", *flags])
     if tool_id == "shellcheck":
-        return run_simple("shellcheck", ["shellcheck"])
+        flags = ["--norc"] if untrusted else []
+        return run_simple("shellcheck", ["shellcheck", *flags])
     if tool_id == "shfmt":
         return run_simple("shfmt", ["shfmt", "-d"])
     if tool_id == "yamllint":
-        return run_simple("yamllint", ["yamllint"])
+        flags = ["-d", "extends: default"] if untrusted else []
+        return run_simple("yamllint", ["yamllint", *flags])
     if tool_id == "verible-lint":
         return run_simple("verible-verilog-lint", ["verible-verilog-lint"])
     if tool_id == "verible-format":
@@ -654,7 +772,8 @@ def execute_tool(
             if has_dialect
             else ["sqlfluff", "lint", "--dialect", "postgres"]
         )
-        return run_simple("sqlfluff", base)
+        flags = ["--ignore-local-config"] if untrusted else []
+        return run_simple("sqlfluff", [*base, *flags])
 
     if tool_id == "actionlint":
         exe = shutil.which("actionlint")
@@ -676,7 +795,7 @@ def execute_tool(
                     work_root / ".github" / "actionlint.yaml",
                     work_root / ".github" / "actionlint.yml",
                 ):
-                    if cand.is_file():
+                    if not untrusted and cand.is_file():
                         existing_cfg = cand
                         break
                 tmp_cfg = Path(tmpdir) / "actionlint.yaml"
@@ -722,12 +841,14 @@ def execute_tool(
                             time.monotonic() - t0,
                         )
                 cfg_args = ["-config-file", str(tmp_cfg)]
+            if untrusted:
+                cfg_args.extend(["-shellcheck=", "-pyflakes="])
             cmd = (
                 [exe, *cfg.override_args, *operands]
                 if cfg.override_args is not None
                 else [exe, *cfg_args, *extra_args, *operands]
             )
-            res = run_cmd(cmd, cwd=work_root)
+            res = run_cmd(cmd, cwd=work_root, env=tool_env)
             out = (
                 res.stdout.decode("utf-8", errors="replace")
                 + res.stderr.decode("utf-8", errors="replace")
@@ -871,6 +992,8 @@ def execute_tool(
         )
 
     if tool_id == "biome":
+        if untrusted:
+            return run_simple("biome", ["biome", "check", "--vcs-enabled=false"])
         exe = resolve_js_tool("biome", None, work_root)
         if exe is None:
             for rel in filtered_files:
@@ -959,7 +1082,7 @@ def execute_tool(
 
     if tool_id == "gitleaks":
         return scan_secrets(
-            repo_root, work_root, gitleaks_ranges, uncommitted_files, t0
+            repo_root, work_root, gitleaks_ranges, uncommitted_files, t0, untrusted
         )
 
     if tool_id == "semgrep":
@@ -993,22 +1116,33 @@ def execute_tool(
                 elapsed=time.monotonic() - t0,
                 blocking=False,
             )
-        cmd = (
-            [exe, *cfg.override_args, *operands]
+        scan_args = (
+            cfg.override_args
             if cfg.override_args is not None
-            else [
-                exe,
-                "scan",
-                *cfg_args,
-                "--metrics",
-                "off",
-                "--disable-version-check",
-                "--error",
-                *extra_args,
-                *operands,
-            ]
+            else ["scan", *cfg_args, "--error", *extra_args]
         )
-        res = run_cmd(cmd, cwd=work_root)
+        end = scan_args.index("--") if "--" in scan_args else len(scan_args)
+        options = iter(scan_args[:end])
+        fixed_args = []
+        for arg in options:
+            if arg == "--metrics":
+                next(options, None)
+            elif not arg.startswith("--metrics=") and arg not in (
+                "--enable-version-check",
+                "--disable-version-check",
+            ):
+                fixed_args.append(arg)
+        cmd = [
+            exe,
+            *fixed_args,
+            "--metrics",
+            "off",
+            "--disable-version-check",
+            *scan_args[end:],
+            *operands,
+        ]
+        env = {**os.environ, "SEMGREP_SEND_METRICS": "off"}
+        res = run_cmd(cmd, cwd=work_root, env=env)
         stdout_text = res.stdout.decode("utf-8", errors="replace").strip()
         stderr_text = res.stderr.decode("utf-8", errors="replace").strip()
         combined = "\n".join(part for part in (stdout_text, stderr_text) if part)
@@ -1047,7 +1181,12 @@ def execute_tool(
 
 
 def scan_secrets(
-    repo_root: Path, work_root: Path, ranges: list[str], files: list[str], start: float
+    repo_root: Path,
+    work_root: Path,
+    ranges: list[str],
+    files: list[str],
+    start: float,
+    untrusted: bool,
 ) -> ToolResult:
     if not ranges and not files:
         return ToolResult(
@@ -1066,11 +1205,19 @@ def scan_secrets(
         )
 
     # Pin default rules and use only the evaluated tree's native fingerprint list.
-    env = os.environ.copy()
+    env = (
+        {
+            key: value
+            for key, value in os.environ.items()
+            if key == "PATH" or key.startswith("GIT_")
+        }
+        if untrusted
+        else os.environ.copy()
+    )
     env.pop("GITLEAKS_CONFIG", None)
     env["GITLEAKS_CONFIG_TOML"] = "[extend]\nuseDefault = true\n"
     allowlist = work_root / ".gitleaksignore"
-    has_allowlist = allowlist.is_file() and not allowlist.is_symlink()
+    has_allowlist = not untrusted and allowlist.is_file() and not allowlist.is_symlink()
     with tempfile.TemporaryDirectory(prefix="az-gitleaks-") as tmpdir:
         # Gitleaks also reads .gitleaksignore from its current directory.
         # Bind Git's object store without exposing the live checkout's files.
@@ -1082,40 +1229,64 @@ def scan_secrets(
                 "cannot resolve Git objects for secret scan",
                 time.monotonic() - start,
             )
-        env["GIT_DIR"] = os.fsdecode(git_dir.stdout.rstrip(b"\n"))
+        git_dir_path = (
+            git_dir.stdout.removesuffix(b"\n")
+            if untrusted
+            else git_dir.stdout.rstrip(b"\n")
+        )
+        env["GIT_DIR"] = os.fsdecode(git_dir_path)
         env["GIT_WORK_TREE"] = tmpdir
+        if untrusted:
+            env.update(HOME=tmpdir, TMPDIR=tmpdir)
         ignore_path = str(allowlist) if has_allowlist else tmpdir
         flags = [
             "--no-banner",
             "--redact=100",
             "--exit-code=1",
-            "--log-level=warn",
+            "--log-level=error" if untrusted else "--log-level=warn",
             "--ignore-gitleaks-allow",
             f"--gitleaks-ignore-path={ignore_path}",
         ]
         # Include changes introduced at merges as well as ordinary commits.
+        log_options = "--diff-merges=first-parent"
+        if untrusted:
+            log_options += (
+                " --root --no-ext-diff --no-textconv --text --no-relative"
+                " --no-color --no-notes --pretty=medium --src-prefix=a/ --dst-prefix=b/"
+            )
         commands = [
-            [exe, "git", *flags, f"--log-opts=--diff-merges=first-parent {rng}", "."]
+            [exe, "git", *flags, f"--log-opts={log_options} {rng}", "."]
             for rng in ranges
         ]
         commands.extend(
             [exe, "dir", *flags, str(repo_root / rel)]
             for rel in files
-            if (repo_root / rel).is_file() and not (repo_root / rel).is_symlink()
+            if (repo_root / rel).is_file()
+            and not (repo_root / rel).is_symlink()
+            and (not untrusted or (repo_root / rel).resolve() == repo_root / rel)
         )
-        codes = [
+        results = [
             subprocess.run(
                 cmd,
                 cwd=tmpdir,
                 env=env,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE if untrusted else subprocess.DEVNULL,
                 check=False,
-            ).returncode
+            )
             for cmd in commands
         ]
-    failed = next((code for code in codes if code), 0)
-    detail = f"secrets scan failed (exit {failed})" if failed else "secrets scan clean"
+    # Gitleaks can log a Git error and still exit successfully.
+    failed = next(
+        (res for res in results if res.returncode or (untrusted and res.stderr)),
+        None,
+    )
+    if failed is None:
+        detail = "secrets scan clean"
+    elif failed.returncode:
+        detail = f"secrets scan failed (exit {failed.returncode})"
+    else:
+        detail = "secrets scan incomplete (scanner reported an error)"
     if has_allowlist:
         detail += "; allowlist: .gitleaksignore"
     return ToolResult(
@@ -1124,7 +1295,7 @@ def scan_secrets(
 
 
 def collect_changed_mode(
-    repo: Path, base_arg: str | None
+    repo: Path, base_arg: str | None, untrusted: bool
 ) -> tuple[list[str], list[str], list[str]]:
     if base_arg:
         base_check = run_cmd(
@@ -1148,15 +1319,21 @@ def collect_changed_mode(
             raise RuntimeError("No base ref provided and no default branch found")
     base_sha = find_merge_base(repo, default_ref, "HEAD") or default_ref
 
-    committed_and_wt = git_lines_z(
-        repo, ["diff", "--name-only", "--diff-filter=d", "-z", base_sha]
-    )
+    diff_args = ["diff", "--name-only", "--diff-filter=d", "-z"]
+    if untrusted:
+        diff_args.extend(
+            [
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-relative",
+                "--ignore-submodules=all",
+            ]
+        )
+    committed_and_wt = git_lines_z(repo, [*diff_args, base_sha])
     untracked = git_lines_z(repo, ["ls-files", "--others", "--exclude-standard", "-z"])
     all_files = sorted(set(committed_and_wt) | set(untracked))
 
-    dirty_tracked = git_lines_z(
-        repo, ["diff", "--name-only", "--diff-filter=d", "-z", "HEAD"]
-    )
+    dirty_tracked = git_lines_z(repo, [*diff_args, "HEAD"])
     uncommitted = sorted(set(dirty_tracked) | set(untracked))
     gitleaks_ranges = [f"{base_sha}..HEAD"]
     return all_files, gitleaks_ranges, uncommitted
@@ -1180,7 +1357,7 @@ def remote_head(repo: Path, remote: str) -> str | None:
 
 
 def collect_pre_push_mode(
-    repo: Path, remote: str, stdin_text: str
+    repo: Path, remote: str, stdin_text: str, untrusted: bool
 ) -> list[tuple[str, str, list[str], list[str]]]:
     """Group each ref's changed files and scan range by exact tip."""
     tips: dict[str, tuple[list[str], set[str], set[str]]] = {}
@@ -1202,7 +1379,7 @@ def collect_pre_push_mode(
             continue  # Ref deletion.
         is_new_ref = old_sha == "0" * len(old_sha)
         use_default = is_new_ref or remote_ref.startswith("refs/heads/")
-        if use_default and not default_resolved:
+        if use_default and not default_resolved and not untrusted:
             default_sha = remote_head(repo, remote)
             default_resolved = True
         # Secrets can appear in outgoing commits even when the final diff is clean.
@@ -1234,6 +1411,11 @@ def collect_pre_push_mode(
                 "diff",
                 "--name-only",
                 "--diff-filter=d",
+                *(
+                    ["--no-ext-diff", "--no-textconv", "--no-relative"]
+                    if untrusted
+                    else []
+                ),
                 "-z",
                 diff_base,
                 local_sha,
@@ -1250,7 +1432,9 @@ def collect_pre_push_mode(
     ]
 
 
-def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
+def materialize_snapshot(
+    repo: Path, commit_sha: str, dest: Path, untrusted: bool
+) -> None:
     # Read raw Git blobs so export-ignore, export-subst and checkout filters
     # cannot change the source the tools evaluate.
     blobs = []
@@ -1258,6 +1442,12 @@ def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
         header, path = entry.split("\t", 1)
         mode, kind, oid = header.split()
         if kind == "blob":
+            if untrusted:
+                parts = path.split("/")
+                if Path(path).parts != tuple(parts) or any(
+                    part.lower() in ("", ".", "..", ".git") for part in parts
+                ):
+                    raise RuntimeError("invalid path in Git snapshot")
             blobs.append((mode, path, oid))
 
     with tempfile.TemporaryFile() as requests:
@@ -1278,10 +1468,12 @@ def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
                     remaining = int(header[2])
                     path = dest / rel
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    if mode == "120000":
+                    if mode == "120000" and untrusted:
+                        proc.stdout.read(remaining)
+                    elif mode == "120000":
                         path.symlink_to(os.fsdecode(proc.stdout.read(remaining)))
                     else:
-                        with path.open("wb") as blob:
+                        with path.open("xb" if untrusted else "wb") as blob:
                             while remaining:
                                 chunk = proc.stdout.read(min(remaining, 1024 * 1024))
                                 if not chunk:
@@ -1290,7 +1482,7 @@ def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
                                     )
                                 blob.write(chunk)
                                 remaining -= len(chunk)
-                        if mode == "100755":
+                        if mode == "100755" and not untrusted:
                             path.chmod(0o755)
                     if proc.stdout.read(1) != b"\n":
                         raise RuntimeError(f"Truncated snapshot object {oid}")
@@ -1300,6 +1492,8 @@ def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
             if proc.wait() != 0:
                 raise RuntimeError(f"Failed to snapshot {commit_sha}")
 
+    if untrusted:
+        return
     # Supply installed dependencies while keeping the source and configs at the tip.
     package_dirs = {Path(".")}
     package_dirs.update(
@@ -1311,7 +1505,7 @@ def materialize_snapshot(repo: Path, commit_sha: str, dest: Path) -> None:
             (dest / deps).symlink_to(repo / deps, target_is_directory=True)
 
 
-def create_log_path(repo_root: Path) -> Path:
+def create_log_path(repo_root: Path, untrusted: bool) -> Path:
     base = os.environ.get("AZ_LINT_LOG_DIR")
     if base:
         log_dir = Path(base)
@@ -1321,18 +1515,32 @@ def create_log_path(repo_root: Path) -> Path:
         )
         log_dir = state_home / "az-lint"
     try:
+        if untrusted:
+            absolute = log_dir.absolute()
+            log_dir = absolute.resolve()
+            if absolute != log_dir or log_dir.is_relative_to(repo_root):
+                raise OSError(
+                    "untrusted mode requires a log directory outside the checkout"
+                )
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
-        log_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "az-lint"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = Path(tempfile.mkdtemp(prefix="az-lint-"))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  # noqa: UP017
-    return log_dir / f"{repo_root.name}-{stamp}-{os.getpid()}.log"
+    name = (
+        re.sub(r"[\x00-\x1f\x7f]", "_", repo_root.name) if untrusted else repo_root.name
+    )
+    return log_dir / f"{name}-{stamp}-{os.getpid()}.log"
 
 
-def classify_files(files: list[str], work_root: Path) -> dict[str, list[str]]:
+def classify_files(
+    files: list[str], work_root: Path, untrusted: bool
+) -> dict[str, list[str]]:
     buckets: dict[str, list[str]] = {tid: [] for tid in ALL_TOOL_IDS}
     for rel in files:
-        if not (work_root / rel).is_file() or (work_root / rel).is_symlink():
+        path = work_root / rel
+        if not path.is_file() or path.is_symlink():
+            continue
+        if untrusted and path.resolve() != path:
             continue
         ext = PurePosixPath(rel).suffix.lower()
         if ext in RUST_EXTS:
@@ -1403,18 +1611,38 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional path to .az-lint.toml (default: <repo>/.az-lint.toml).",
     )
+    parser.add_argument(
+        "--untrusted",
+        action="store_true",
+        default=os.environ.get("AZ_LINT_UNTRUSTED") == "1",
+        help="Ignore checkout configuration and run only read-only offline checks.",
+    )
     args = parser.parse_args(argv)
 
     target = Path(args.repo).resolve()
-    top_res = run_cmd(
-        ["git", "-C", str(target), "rev-parse", "--show-toplevel"], cwd=Path.cwd()
-    )
+    try:
+        checkout = restrict_untrusted_environment(target) if args.untrusted else None
+        top_res = run_cmd(
+            ["git", "-C", str(target), "rev-parse", "--show-toplevel"], cwd=Path.cwd()
+        )
+    except (OSError, RuntimeError) as exc:
+        sys.stderr.write(f"az-lint: {exc}\n")
+        return 2
     if top_res.returncode != 0:
         sys.stderr.write(f"az-lint: not a git repository: {target}\n")
         return 2
-    repo_root = Path(top_res.stdout.decode("utf-8", errors="replace").strip()).resolve()
+    root = (
+        os.fsdecode(top_res.stdout.removesuffix(b"\n"))
+        if args.untrusted
+        else top_res.stdout.decode("utf-8", errors="replace").strip()
+    )
+    repo_root = Path(root).resolve()
+    if checkout is not None and repo_root != checkout:
+        sys.stderr.write("az-lint: Git worktree root differs from checkout\n")
+        return 2
 
-    explicit_config = Path(args.config).resolve() if args.config else None
+    config_path = Path(os.path.abspath(args.config)) if args.config else None
+    explicit_config = config_path.resolve() if config_path else None
     t_start = time.monotonic()
     groups: list[tuple[str, int, int, list[ToolResult]]] = []
 
@@ -1425,20 +1653,47 @@ def main(argv: list[str] | None = None) -> int:
         ranges: list[str],
         uncommitted: list[str],
     ) -> None:
-        lint_cfg = load_config(explicit_config or work_root / ".az-lint.toml")
+        config = explicit_config
+        if config is None and not args.untrusted:
+            config = work_root / ".az-lint.toml"
+        lint_cfg = load_config(config)
         included = [f for f in changed if not is_excluded(f, lint_cfg.global_exclude)]
-        buckets = classify_files(included, work_root)
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        buckets = classify_files(included, work_root, args.untrusted)
+        scratch = (
+            tempfile.TemporaryDirectory(prefix="az-lint-input-")
+            if args.untrusted
+            else nullcontext(work_root)
+        )
+        with scratch as directory, ThreadPoolExecutor(max_workers=4) as pool:
+            lint_root = Path(directory)
+            tool_env = None
+            if args.untrusted:
+                tool_home = lint_root / "home"
+                tool_home.mkdir()
+                lint_root = lint_root / "input"
+                lint_root.mkdir()
+                tool_env = {
+                    "PATH": os.environ["PATH"],
+                    "HOME": str(tool_home),
+                    "TMPDIR": str(tool_home),
+                }
+                # Give linters source files without the checkout's configs or dependencies.
+                for rel in {f for tid in UNTRUSTED_TOOLS for f in buckets[tid]}:
+                    dest = lint_root / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(work_root / rel, dest)
             futures = [
                 pool.submit(
                     execute_tool,
                     tid,
                     lint_cfg.tools[tid],
                     buckets[tid],
-                    work_root,
+                    lint_root,
                     repo_root,
                     ranges,
                     uncommitted,
+                    args.untrusted,
+                    tool_env,
                 )
                 for tid in ALL_TOOL_IDS
             ]
@@ -1446,19 +1701,54 @@ def main(argv: list[str] | None = None) -> int:
         groups.append((label, len(changed), len(included), results))
 
     try:
+        if args.untrusted:
+            if any(
+                p is not None and p.is_relative_to(repo_root)
+                for p in (config_path, explicit_config)
+            ):
+                raise ConfigError(
+                    "--config must be outside the checkout in untrusted mode"
+                )
+            if Path(tempfile.gettempdir()).resolve().is_relative_to(repo_root):
+                raise ConfigError(
+                    "untrusted mode requires a temporary directory outside the checkout"
+                )
+            # Checkout attributes can select locally configured clean filters during git diff.
+            filters = run_cmd(
+                [
+                    "git",
+                    "config",
+                    "--null",
+                    "--name-only",
+                    "--get-regexp",
+                    r"^filter\..*\.(clean|process|required)$",
+                ],
+                cwd=repo_root,
+            )
+            if filters.returncode not in (0, 1):
+                raise RuntimeError("cannot read Git filter configuration")
+            set_git_options(
+                {
+                    key: "false" if key.endswith(".required") else ""
+                    for key in os.fsdecode(filters.stdout).split("\0")
+                    if key
+                }
+            )
         if args.pre_push:
             remote = args.remote_url or args.remote
-            tips = collect_pre_push_mode(repo_root, remote, sys.stdin.read())
+            tips = collect_pre_push_mode(
+                repo_root, remote, sys.stdin.read(), args.untrusted
+            )
             if not tips:
                 lint_tree("", repo_root, [], [], [])
             for sha, refs, changed, ranges in tips:
                 with tempfile.TemporaryDirectory(prefix="az-lint-snap-") as snapshot:
                     work_root = Path(snapshot)
-                    materialize_snapshot(repo_root, sha, work_root)
+                    materialize_snapshot(repo_root, sha, work_root, args.untrusted)
                     lint_tree(f"[{refs} {sha[:12]}]", work_root, changed, ranges, [])
         else:
             changed, ranges, uncommitted = collect_changed_mode(
-                repo_root, args.changed or None
+                repo_root, args.changed or None, args.untrusted
             )
             lint_tree("", repo_root, changed, ranges, uncommitted)
     except (ConfigError, OSError, RuntimeError) as exc:
@@ -1479,7 +1769,7 @@ def main(argv: list[str] | None = None) -> int:
         for r in results
         if r.tool_id == "gitleaks"
     )
-    log_path = create_log_path(repo_root)
+    log_path = create_log_path(repo_root, args.untrusted)
     log_lines = [
         f"az-lint repo={repo_root} mode={'pre-push' if args.pre_push else 'changed'}"
     ]

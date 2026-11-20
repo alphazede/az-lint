@@ -11,8 +11,29 @@ The runner looks for linters on `PATH`. Biome can also use a local installation.
 When `package.json` defines a `typecheck` script, the runner invokes the local
 `node_modules/.bin/tsc --noEmit` directly. Clippy uses `--offline --locked` by
 default, so keep `Cargo.lock` and install project dependencies before linting.
-Run az-lint with the same trust and isolation you use for the project's build.
-Project tools such as Clippy can execute build scripts.
+
+## Trust model
+
+Use default mode only for repositories you trust to build. In default mode,
+az-lint reads project configuration, can run local JavaScript tools, and can
+run Clippy, which executes build scripts.
+
+Use `--untrusted` or set `AZ_LINT_UNTRUSTED=1` to check a pull request from an
+untrusted contributor. Run a trusted copy of az-lint with trusted tools on
+`PATH`. Start it in a trusted environment and create the Git metadata with
+a fresh checkout. The runner ignores inherited Git controls and the
+checkout's `.az-lint.toml` and runs supported linters on copied files with
+fixed, read-only, offline arguments.
+
+Use `--config <path>` to supply trusted enable settings and file exclusions.
+Keep the config and its resolved path outside the checkout. The runner
+reports checks that require custom arguments or project-dependent tools as
+`SKIP` and prints the reason. This includes Cargo fmt, Clippy, TypeScript,
+Verilator, and Semgrep. Gitleaks stays mandatory and ignores the checkout's
+fingerprint allowlist. In offline pre-push mode, new refs scan all reachable
+history and existing refs use the old tip from Git's pre-push input.
+
+## Tested versions
 
 | Files | Linters and tested versions |
 | --- | --- |
@@ -49,10 +70,10 @@ and `--remote-url "$2"`, and pass Git's pre-push refs on standard input.
 
 ## Run in GitHub Actions
 
-For a `pull_request` job, check out the project with full history and put
-az-lint in a sibling directory. Replace the example `ref` with the full commit
-SHA behind the release tag. Install the applicable linters before the last
-step.
+Use `--untrusted` in public pull-request CI. Check out the project with full
+history and put az-lint in a sibling directory. Replace the example `ref` with
+the full commit SHA behind the release tag. Install the applicable linters
+before the last step. Run lint without credentials or outbound network access.
 
 ```yaml
 - name: Check out project
@@ -72,7 +93,7 @@ step.
   working-directory: project
   env:
     BASE_SHA: ${{ github.event.pull_request.base.sha }}
-  run: ../az-lint-package/az-lint --changed "$BASE_SHA"
+  run: ../az-lint-package/az-lint --untrusted --changed "$BASE_SHA"
 ```
 
 ## Configure a repository
@@ -102,7 +123,7 @@ Gitleaks output and reports the status.
 
 Semgrep checks changed files when it finds `.semgrep.yml` or `.semgrep` at the
 repository root, or when you supply a rules configuration. Its findings and
-errors are advisory.
+errors are advisory. az-lint disables Semgrep metrics and version checks.
 
 ## Read the result
 
