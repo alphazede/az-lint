@@ -146,6 +146,10 @@ case "$tool" in
         fi
         if [[ "$1" == check ]]; then
           for file in "$@"; do
+            if [[ "$file" == *.py && -f "$file" && ! -x "$file" ]] && grep -q '^#!' "$file"; then
+              printf 'EXE001 Shebang is present but file is not executable: %s\n' "$file"
+              exit 1
+            fi
             if [[ "$file" == *.py && -f "$file" ]] && grep -qx 'import sys' "$file"; then
               if [[ ! -f .ruff.toml ]] || ! grep -q 'F401' .ruff.toml; then
                 printf 'stub ruff import error: %s\n' "$file"
@@ -884,6 +888,41 @@ ln -s "$UNTRUSTED/.az-lint.toml" "$WORK/linked.toml"
 	--config "$WORK/linked.toml" >"$WORK/untrusted-config.out" 2>&1
 assert_rc "10 untrusted rejects config symlink into checkout" 2 "$?" "$WORK/untrusted-config.out"
 assert_grep "10 untrusted config explains rejection" 'config.*outside.*checkout' "$WORK/untrusted-config.out"
+
+MODES="$WORK/untrusted-modes"
+new_repo "$MODES"
+git -C "$MODES" commit -qm base --allow-empty
+MODE_BASE=$(git -C "$MODES" rev-parse HEAD)
+printf '#!/usr/bin/env python3\nprint("test")\n' >"$MODES/script.py"
+ln -s "$WORK/external/outside.py" "$MODES/link.py"
+for mode in executable non-executable; do
+	if [[ "$mode" == executable ]]; then
+		chmod 755 "$MODES/script.py"
+		want=0 status=PASS
+	else
+		chmod 644 "$MODES/script.py"
+		want=1 status=FAIL
+	fi
+	save_commit "$MODES"
+	MODE_TIP=$(git -C "$MODES" rev-parse HEAD)
+	for entry in changed pre-push; do
+		case_id="BUG8-$entry-$mode"
+		out="$WORK/$case_id.out"
+		if [[ "$entry" == changed ]]; then
+			"$AZ_LINT" --untrusted --repo "$MODES" --changed "$MODE_BASE" >"$out" 2>&1
+		else
+			printf 'refs/heads/main %s refs/heads/main %s\n' "$MODE_TIP" "$MODE_BASE" |
+				"$AZ_LINT" --untrusted --repo "$MODES" --pre-push >"$out" 2>&1
+		fi
+		rc=$?
+		lint_log=$(sed -n 's/^log: //p' "$out")
+		assert_rc "$case_id" "$want" "$rc" "${lint_log:-$out}"
+		assert_grep "$case_id Ruff checks only the script" "^ruff-check[[:space:]]+${status}[[:space:]]+1 file\(s\)" "$out"
+		if [[ "$want" == 1 ]]; then
+			assert_grep "$case_id Ruff diagnostic" 'EXE001 Shebang is present but file is not executable' "${lint_log:-$out}"
+		fi
+	done
+done
 
 printf '#!/bin/sh\nexit 0\n' >"$UNTRUSTED/"$'-script with spaces\nand newline.sh'
 save_commit "$UNTRUSTED"

@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.2]
+
+- Preserve executable file modes in untrusted linting so Ruff accepts executable Python scripts with shebangs.
+
 ## [0.1.1]
 
 - Add `--untrusted` for offline linting of untrusted checkouts.

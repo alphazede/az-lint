@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1482,8 +1483,8 @@ def materialize_snapshot(
                                     )
                                 blob.write(chunk)
                                 remaining -= len(chunk)
-                        if mode == "100755" and not untrusted:
-                            path.chmod(0o755)
+                        if untrusted or mode == "100755":
+                            path.chmod(0o755 if mode == "100755" else 0o644)
                     if proc.stdout.read(1) != b"\n":
                         raise RuntimeError(f"Truncated snapshot object {oid}")
             except BaseException:
@@ -1530,6 +1531,35 @@ def create_log_path(repo_root: Path, untrusted: bool) -> Path:
         re.sub(r"[\x00-\x1f\x7f]", "_", repo_root.name) if untrusted else repo_root.name
     )
     return log_dir / f"{name}-{stamp}-{os.getpid()}.log"
+
+
+def copy_untrusted_file(root: Path, rel: str, dest: Path) -> None:
+    parts = rel.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise RuntimeError("invalid path in lint input")
+    # Open each component without following symlinks, even if the checkout changes.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(root, directory_flags)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+        )
+    finally:
+        os.close(directory)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError("lint input is not a regular file")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(fd, "rb", closefd=False) as source, dest.open("xb") as target:
+            shutil.copyfileobj(source, target)
+        dest.chmod(0o755 if mode & 0o111 else 0o644)
+    finally:
+        os.close(fd)
 
 
 def classify_files(
@@ -1679,9 +1709,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 # Give linters source files without the checkout's configs or dependencies.
                 for rel in {f for tid in UNTRUSTED_TOOLS for f in buckets[tid]}:
-                    dest = lint_root / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(work_root / rel, dest)
+                    copy_untrusted_file(work_root, rel, lint_root / rel)
             futures = [
                 pool.submit(
                     execute_tool,
