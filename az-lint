@@ -1229,7 +1229,12 @@ def scan_secrets(
                 "cannot resolve Git objects for secret scan",
                 time.monotonic() - start,
             )
-        env["GIT_DIR"] = os.fsdecode(git_dir.stdout.rstrip(b"\n"))
+        git_dir_path = (
+            git_dir.stdout.removesuffix(b"\n")
+            if untrusted
+            else git_dir.stdout.rstrip(b"\n")
+        )
+        env["GIT_DIR"] = os.fsdecode(git_dir_path)
         env["GIT_WORK_TREE"] = tmpdir
         if untrusted:
             env.update(HOME=tmpdir, TMPDIR=tmpdir)
@@ -1512,7 +1517,10 @@ def create_log_path(repo_root: Path, untrusted: bool) -> Path:
     except OSError:
         log_dir = Path(tempfile.mkdtemp(prefix="az-lint-"))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  # noqa: UP017
-    return log_dir / f"{repo_root.name}-{stamp}-{os.getpid()}.log"
+    name = (
+        re.sub(r"[\x00-\x1f\x7f]", "_", repo_root.name) if untrusted else repo_root.name
+    )
+    return log_dir / f"{name}-{stamp}-{os.getpid()}.log"
 
 
 def classify_files(
@@ -1614,7 +1622,12 @@ def main(argv: list[str] | None = None) -> int:
     if top_res.returncode != 0:
         sys.stderr.write(f"az-lint: not a git repository: {target}\n")
         return 2
-    repo_root = Path(top_res.stdout.decode("utf-8", errors="replace").strip()).resolve()
+    root = (
+        os.fsdecode(top_res.stdout.removesuffix(b"\n"))
+        if args.untrusted
+        else top_res.stdout.decode("utf-8", errors="replace").strip()
+    )
+    repo_root = Path(root).resolve()
     if checkout is not None and repo_root != checkout:
         sys.stderr.write("az-lint: Git worktree root differs from checkout\n")
         return 2

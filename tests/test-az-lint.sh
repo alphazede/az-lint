@@ -924,6 +924,20 @@ else
 	fail "11 untrusted log destination" "expected a private temporary log outside the checkout" "$WORK/untrusted-log.out"
 fi
 
+WHITESPACE_REPO="$WORK/"$'checkout with trailing whitespace \n'
+new_repo "$WHITESPACE_REPO"
+git -C "$WHITESPACE_REPO" commit -qm base --allow-empty
+printf '#!/bin/sh\nexit 0\n' >"$WHITESPACE_REPO/scan.sh"
+"$AZ_LINT" --untrusted --repo "$WHITESPACE_REPO" --changed HEAD >"$WORK/untrusted-root-name.out" 2>&1
+assert_rc "11 untrusted checkout name can end in whitespace" 0 "$?" "$WORK/untrusted-root-name.out"
+assert_tool_status "11 untrusted checkout with whitespace" PASS "$WORK/untrusted-root-name.out" shellcheck gitleaks
+whitespace_log=$(sed -n 's/^log: //p' "$WORK/untrusted-root-name.out")
+if [[ -f "$whitespace_log" ]]; then
+	ok "11 untrusted checkout with whitespace prints a usable log path"
+else
+	fail "11 untrusted checkout log path" "expected a single usable path" "$WORK/untrusted-root-name.out"
+fi
+
 printf '[tools.semgrep]\noverride_args = ["scan", "--config", ".semgrep.yml", "--error"]\n' \
 	>"$WORK/semgrep-override.toml"
 "$AZ_LINT" --repo "$REPO" --changed main --config "$WORK/semgrep-override.toml" \
