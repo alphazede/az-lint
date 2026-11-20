@@ -791,6 +791,26 @@ else
 fi
 assert_grep "8 local compiler still reports project diagnostics" '^tsc[[:space:]]+PASS.*advisory' "$WORK/script.out"
 rm -f "$FIX/script-marker"
+# A package with a typecheck script but no tsconfig.json has no project to
+# compile: plain `tsc --noEmit` prints its help and exits 1 there.
+mv "$FIX/tsconfig.json" "$WORK/tsconfig.keep"
+"$AZ_LINT" --repo "$FIX" --changed "$SCOPE_BASE" >"$WORK/noproject.out" 2>&1
+assert_rc "8b package without tsconfig.json does not fail the run" 0 "$?" "$WORK/noproject.out"
+assert_grep "8b tsc is skipped without a project file" '^tsc[[:space:]]+SKIP.*tsconfig\.json' "$WORK/noproject.out"
+
+mkdir -p "$FIX/nested/node_modules/.bin"
+printf '{"scripts":{"typecheck":"tsc --noEmit"}}\n' >"$FIX/nested/package.json"
+printf 'debugger;\n' >"$FIX/nested/bad.ts"
+ln -s "$(type -P biome)" "$FIX/nested/node_modules/.bin/biome"
+PATH="$RESTRICTED_BIN" "$AZ_LINT" --repo "$FIX" --changed "$SCOPE_BASE" >"$WORK/package-biome.out" 2>&1
+assert_tool_status "8c package-local Biome without tsconfig.json" FAIL "$WORK/package-biome.out" biome
+rm -f "$FIX/nested/node_modules/.bin/biome"
+
+mv "$WORK/tsconfig.keep" "$FIX/tsconfig.json"
+printf 'export const bad: number = "wrong type";\n' >"$FIX/nested/bad.ts"
+"$AZ_LINT" --repo "$FIX" --changed "$SCOPE_BASE" >"$WORK/ancestor-tsconfig.out" 2>&1
+assert_rc "8d ancestor tsconfig.json still blocks a changed TypeScript error" 1 "$?" "$WORK/ancestor-tsconfig.out"
+assert_tool_status "8d ancestor tsconfig.json" FAIL "$WORK/ancestor-tsconfig.out" tsc
 
 save_commit "$FIX"
 ACTION_BASE=$(git -C "$FIX" rev-parse HEAD)

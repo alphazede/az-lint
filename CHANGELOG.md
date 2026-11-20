@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.3]
+
+- Skip TypeScript checks for packages without a reachable `tsconfig.json`. A package can use a config from a parent directory inside the checkout.
+- Keep package-local Biome checks available when TypeScript has no project config.
+
 ## [0.1.2]
 
 - Preserve executable file modes in untrusted linting so Ruff accepts executable Python scripts with shebangs.
