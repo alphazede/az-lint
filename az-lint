@@ -8,11 +8,13 @@ and supports both `--changed <base>` and `--pre-push` hook modes.
 from __future__ import annotations
 
 import argparse
+import errno
 import fnmatch
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1482,8 +1484,8 @@ def materialize_snapshot(
                                     )
                                 blob.write(chunk)
                                 remaining -= len(chunk)
-                        if mode == "100755" and not untrusted:
-                            path.chmod(0o755)
+                        if untrusted or mode == "100755":
+                            path.chmod(0o755 if mode == "100755" else 0o644)
                     if proc.stdout.read(1) != b"\n":
                         raise RuntimeError(f"Truncated snapshot object {oid}")
             except BaseException:
@@ -1532,15 +1534,53 @@ def create_log_path(repo_root: Path, untrusted: bool) -> Path:
     return log_dir / f"{name}-{stamp}-{os.getpid()}.log"
 
 
+def copy_untrusted_file(root: Path, rel: str, dest: Path) -> bool:
+    parts = rel.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise RuntimeError("invalid path in lint input")
+    # Open each component without following symlinks, even if the checkout changes.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(root, directory_flags)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+        )
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            return False
+        raise
+    finally:
+        os.close(directory)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with os.fdopen(fd, "rb", closefd=False) as source, dest.open("xb") as target:
+            shutil.copyfileobj(source, target)
+        dest.chmod(0o755 if mode & 0o111 else 0o644)
+        return True
+    finally:
+        os.close(fd)
+
+
 def classify_files(
     files: list[str], work_root: Path, untrusted: bool
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], int]:
     buckets: dict[str, list[str]] = {tid: [] for tid in ALL_TOOL_IDS}
+    skipped = 0
     for rel in files:
         path = work_root / rel
-        if not path.is_file() or path.is_symlink():
-            continue
-        if untrusted and path.resolve() != path:
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or (untrusted and path.resolve() != path)
+        ):
+            skipped += 1
             continue
         ext = PurePosixPath(rel).suffix.lower()
         if ext in RUST_EXTS:
@@ -1569,7 +1609,7 @@ def classify_files(
             buckets["clang-format"].append(rel)
             buckets["cppcheck"].append(rel)
         buckets["semgrep"].append(rel)
-    return buckets
+    return buckets, skipped
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1658,7 +1698,7 @@ def main(argv: list[str] | None = None) -> int:
             config = work_root / ".az-lint.toml"
         lint_cfg = load_config(config)
         included = [f for f in changed if not is_excluded(f, lint_cfg.global_exclude)]
-        buckets = classify_files(included, work_root, args.untrusted)
+        buckets, skipped = classify_files(included, work_root, args.untrusted)
         scratch = (
             tempfile.TemporaryDirectory(prefix="az-lint-input-")
             if args.untrusted
@@ -1678,10 +1718,26 @@ def main(argv: list[str] | None = None) -> int:
                     "TMPDIR": str(tool_home),
                 }
                 # Give linters source files without the checkout's configs or dependencies.
-                for rel in {f for tid in UNTRUSTED_TOOLS for f in buckets[tid]}:
-                    dest = lint_root / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(work_root / rel, dest)
+                candidates = {f for tid in UNTRUSTED_TOOLS for f in buckets[tid]}
+                unavailable = {
+                    rel
+                    for rel in candidates
+                    if not copy_untrusted_file(work_root, rel, lint_root / rel)
+                }
+                if unavailable:
+                    for tid in ALL_TOOL_IDS:
+                        buckets[tid] = [
+                            rel for rel in buckets[tid] if rel not in unavailable
+                        ]
+                skipped += len(unavailable)
+                if skipped:
+                    print(
+                        (
+                            f"az-lint: skipped {skipped} lint input(s) "
+                            f"(missing, linked, or non-regular) {label}"
+                        ).rstrip(),
+                        file=sys.stderr,
+                    )
             futures = [
                 pool.submit(
                     execute_tool,
