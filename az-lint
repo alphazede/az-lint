@@ -1446,8 +1446,7 @@ def create_log_path(repo_root: Path) -> Path:
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
-        log_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "az-lint"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir = Path(tempfile.mkdtemp(prefix="az-lint-"))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  # noqa: UP017
     return log_dir / f"{repo_root.name}-{stamp}-{os.getpid()}.log"
 

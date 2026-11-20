@@ -67,7 +67,7 @@ ALL_TOOLS=("${LANGUAGE_TOOLS[@]}" gitleaks semgrep)
 RESTRICTED_BIN="$WORK/restricted-bin"
 STUB_BIN="$WORK/stub-bin"
 mkdir -p "$RESTRICTED_BIN" "$STUB_BIN"
-for cmd in bash cat chmod cp date dirname env git git-receive-pack grep ln mkdir mktemp mv python3 rm sed sh stat tail tar; do
+for cmd in bash cat chmod cp date dirname env git git-receive-pack grep ln mkdir mktemp mv python3 rm sed sh stat tail tar touch; do
 	p=$(type -P "$cmd") || {
 		printf 'FATAL: self-test requires %s\n' "$cmd" >&2
 		exit 2
@@ -881,6 +881,15 @@ printf 'refs/heads/main %s refs/heads/main %s\n' "$UNTRUSTED_TIP" "$ZERO" |
 		>"$WORK/untrusted-push.out" 2>&1
 assert_rc "10 untrusted pre-push scans without remote access" 1 "$?" "$WORK/untrusted-push.out"
 assert_tool_status "10 untrusted pre-push still detects secret" FAIL "$WORK/untrusted-push.out" gitleaks
+
+mkdir "$WORK/fallback-tmp"
+touch "$WORK/state-collision"
+AZ_LINT_LOG_DIR="$WORK/state-collision/az-lint" TMPDIR="$WORK/fallback-tmp" \
+	"$AZ_LINT" --repo "$FIX" --changed HEAD >"$WORK/log-fallback.out" 2>&1
+assert_rc "11 log directory failure falls back successfully" 0 "$?" "$WORK/log-fallback.out"
+fallback_log=$(sed -n 's/^log: //p' "$WORK/log-fallback.out")
+assert_rc "11 fallback directory is private" 700 "$(stat -c '%a' "${fallback_log%/*}")" "$WORK/log-fallback.out"
+assert_rc "11 fallback log is private" 600 "$(stat -c '%a' "$fallback_log")" "$WORK/log-fallback.out"
 
 HOOK_REPO="$WORK/hook-source"
 HOOK_WT="$WORK/hook-worktree"
