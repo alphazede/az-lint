@@ -20,7 +20,8 @@ run Clippy, which executes build scripts.
 
 Use `--untrusted` or set `AZ_LINT_UNTRUSTED=1` to check a pull request from an
 untrusted contributor. Run a trusted copy of az-lint with trusted tools on
-`PATH` and Git metadata from a fresh checkout. The runner ignores the
+`PATH`. Start it in a trusted environment and create the Git metadata with
+a fresh checkout. The runner ignores inherited Git controls and the
 checkout's `.az-lint.toml` and runs supported linters on copied files with
 fixed, read-only, offline arguments.
 
