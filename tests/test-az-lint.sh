@@ -858,6 +858,11 @@ else
 fi
 
 rm "$UNTRUSTED/bad.yaml"
+if [[ " ${REAL_TOOLS[*]} " == *" shellcheck "* ]]; then
+	SHELLCHECK_OPTS=--shell=invalid "$AZ_LINT" --untrusted --repo "$UNTRUSTED" --changed HEAD \
+		>"$WORK/untrusted-shellcheck-env.out" 2>&1
+	assert_tool_status "10 untrusted ignores caller ShellCheck options" PASS "$WORK/untrusted-shellcheck-env.out" shellcheck
+fi
 printf '[tools.ruff-check]\noverride_args = ["check", "--fix"]\n' >"$WORK/trusted.toml"
 AZ_LINT_UNTRUSTED=1 "$AZ_LINT" --repo "$UNTRUSTED" --changed HEAD \
 	--config "$WORK/trusted.toml" >"$WORK/untrusted-env.out" 2>&1

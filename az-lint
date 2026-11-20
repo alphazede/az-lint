@@ -614,6 +614,7 @@ def execute_tool(
     gitleaks_ranges: list[str],
     uncommitted_files: list[str],
     untrusted: bool,
+    tool_env: dict[str, str] | None,
 ) -> ToolResult:
     t0 = time.monotonic()
     blocking = tool_id != "semgrep"
@@ -689,7 +690,7 @@ def execute_tool(
         if per_file:
             for rel in operands:
                 cmd = [*cmd_prefix, rel]
-                res = run_cmd(cmd, cwd=work_root)
+                res = run_cmd(cmd, cwd=work_root, env=tool_env)
                 out = (
                     res.stdout.decode("utf-8", errors="replace")
                     + res.stderr.decode("utf-8", errors="replace")
@@ -701,7 +702,7 @@ def execute_tool(
                     worst_rc = res.returncode
         else:
             cmd = [*cmd_prefix, *operands]
-            res = run_cmd(cmd, cwd=work_root)
+            res = run_cmd(cmd, cwd=work_root, env=tool_env)
             out = (
                 res.stdout.decode("utf-8", errors="replace")
                 + res.stderr.decode("utf-8", errors="replace")
@@ -730,7 +731,8 @@ def execute_tool(
         flags = ["--isolated", "--no-cache"] if untrusted else []
         return run_simple("ruff", ["ruff", "format", "--check", *flags])
     if tool_id == "shellcheck":
-        return run_simple("shellcheck", ["shellcheck"])
+        flags = ["--norc"] if untrusted else []
+        return run_simple("shellcheck", ["shellcheck", *flags])
     if tool_id == "shfmt":
         return run_simple("shfmt", ["shfmt", "-d"])
     if tool_id == "yamllint":
@@ -832,7 +834,7 @@ def execute_tool(
                 if cfg.override_args is not None
                 else [exe, *cfg_args, *extra_args, *operands]
             )
-            res = run_cmd(cmd, cwd=work_root)
+            res = run_cmd(cmd, cwd=work_root, env=tool_env)
             out = (
                 res.stdout.decode("utf-8", errors="replace")
                 + res.stderr.decode("utf-8", errors="replace")
@@ -1589,7 +1591,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         with scratch as directory, ThreadPoolExecutor(max_workers=4) as pool:
             lint_root = Path(directory)
+            tool_env = None
             if args.untrusted:
+                tool_home = lint_root / "home"
+                tool_home.mkdir()
+                lint_root = lint_root / "input"
+                lint_root.mkdir()
+                tool_env = {
+                    "PATH": os.environ["PATH"],
+                    "HOME": str(tool_home),
+                    "TMPDIR": str(tool_home),
+                }
                 # Give linters source files without the checkout's configs or dependencies.
                 for rel in {f for tid in UNTRUSTED_TOOLS for f in buckets[tid]}:
                     dest = lint_root / rel
@@ -1606,6 +1618,7 @@ def main(argv: list[str] | None = None) -> int:
                     ranges,
                     uncommitted,
                     args.untrusted,
+                    tool_env,
                 )
                 for tid in ALL_TOOL_IDS
             ]
