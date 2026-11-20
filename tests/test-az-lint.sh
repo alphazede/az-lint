@@ -884,6 +884,14 @@ ln -s "$UNTRUSTED/.az-lint.toml" "$WORK/linked.toml"
 assert_rc "10 untrusted rejects config symlink into checkout" 2 "$?" "$WORK/untrusted-config.out"
 assert_grep "10 untrusted config explains rejection" 'config.*outside.*checkout' "$WORK/untrusted-config.out"
 
+printf '#!/bin/sh\nexit 0\n' >"$UNTRUSTED/"$'-script with spaces\nand newline.sh'
+save_commit "$UNTRUSTED"
+UNTRUSTED_TIP=$(git -C "$UNTRUSTED" rev-parse HEAD)
+printf 'refs/heads/main %s refs/heads/main %s\n' "$UNTRUSTED_TIP" "$ZERO" |
+	"$AZ_LINT" --untrusted --repo "$UNTRUSTED" --pre-push >"$WORK/untrusted-names.out" 2>&1
+assert_rc "10 untrusted pre-push accepts spaces, newlines and leading dashes" 0 "$?" "$WORK/untrusted-names.out"
+assert_grep "10 untrusted pre-push checks both shell files" '^shellcheck[[:space:]]+PASS[[:space:]]+2 file\(s\)' "$WORK/untrusted-names.out"
+
 git -C "$FIX" show "$TIP^:leak.txt" >"$UNTRUSTED/leak.txt"
 save_commit "$UNTRUSTED"
 UNTRUSTED_TIP=$(git -C "$UNTRUSTED" rev-parse HEAD)

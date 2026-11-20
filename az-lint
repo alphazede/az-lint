@@ -1428,6 +1428,12 @@ def materialize_snapshot(
         header, path = entry.split("\t", 1)
         mode, kind, oid = header.split()
         if kind == "blob":
+            if untrusted:
+                parts = path.split("/")
+                if Path(path).parts != tuple(parts) or any(
+                    part.lower() in ("", ".", "..", ".git") for part in parts
+                ):
+                    raise RuntimeError("invalid path in Git snapshot")
             blobs.append((mode, path, oid))
 
     with tempfile.TemporaryFile() as requests:
@@ -1453,7 +1459,7 @@ def materialize_snapshot(
                     elif mode == "120000":
                         path.symlink_to(os.fsdecode(proc.stdout.read(remaining)))
                     else:
-                        with path.open("wb") as blob:
+                        with path.open("xb" if untrusted else "wb") as blob:
                             while remaining:
                                 chunk = proc.stdout.read(min(remaining, 1024 * 1024))
                                 if not chunk:
